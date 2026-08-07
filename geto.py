@@ -762,6 +762,15 @@ def _follower_tick():
 
 
 def on_damage_by(event):
+    # Узумаки использует тот же EntityDamageByEntityEvent через общий хук,
+    # чтобы не регистрировать второй listener в PySpigot.
+    try:
+        if "_uz_on_damage_by" in globals():
+            _uz_on_damage_by(event)
+            if event.isCancelled():
+                return
+    except Exception as ex:
+        Bukkit.getLogger().warning("[geto][uzumaki] damage hook: " + str(ex))
     dmg = event.getDamager()
     ent = event.getEntity()
 
@@ -1337,6 +1346,15 @@ def _passives_tick():
 
 def on_interact(event):
     """Обработка ПКМ по земле яйцом Гето."""
+    # PySpigot допускает только один listener одного Event-класса на скрипт.
+    # Узумаки подключается как хук к уже зарегистрированному PlayerInteractEvent.
+    try:
+        if "_uz_on_interact" in globals():
+            _uz_on_interact(event)
+            if event.isCancelled():
+                return
+    except Exception as ex:
+        Bukkit.getLogger().warning("[geto][uzumaki] interact hook: " + str(ex))
     if event.getHand() != EquipmentSlot.HAND: return
     p = event.getPlayer()
     item = event.getItem()
@@ -2219,10 +2237,8 @@ def _uz_reset_state(target_player):
 try: _reset_reg.put("geto", _uz_reset_state)
 except Exception: pass
 
-listener_mgr.registerListener(_uz_on_interact, PlayerInteractEvent)
 listener_mgr.registerListener(_uz_command_action, PlayerCommandPreprocessEvent)
 listener_mgr.registerListener(_uz_on_damage_any, EntityDamageEvent)
-listener_mgr.registerListener(_uz_on_damage_by, EntityDamageByEntityEvent)
 listener_mgr.registerListener(_uz_on_item_damage, PlayerItemDamageEvent)
 listener_mgr.registerListener(_uz_on_consume, PlayerItemConsumeEvent)
 listener_mgr.registerListener(_uz_on_explode, EntityExplodeEvent)

@@ -1941,7 +1941,10 @@ class CompanyService(object):
             unpaid = round(pool - sum([item[1] for item in payouts]), 2)
             paid = 0.0
             for uuid_str, payout in payouts:
-                deposited, balance = self.economy.deposit_checked(uuid_str, payout, u"Investor")
+                # The UUID identifies the shareholder. "Investor" used to be
+                # passed as a fake player name here and permanently polluted
+                # economy.json / baltop. Never send a role label as identity.
+                deposited, balance = self.economy.deposit_checked(uuid_str, payout, None)
                 if deposited:
                     paid = round(paid + payout, 2)
                 else:

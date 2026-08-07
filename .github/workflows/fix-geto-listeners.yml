@@ -1,0 +1,31 @@
+name: Fix Geto duplicate listeners
+
+on:
+  push:
+    branches: [test]
+    paths:
+      - '.fix_geto_listener_patch.py'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply listener fix
+        run: python .fix_geto_listener_patch.py
+      - name: Commit fixed geto.py and cleanup
+        run: |
+          rm -f .fix_geto_listener_patch.py .github/workflows/fix-geto-listeners.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add geto.py .fix_geto_listener_patch.py .github/workflows/fix-geto-listeners.yml
+          git commit -m "Fix duplicate Geto event listeners" || exit 0
+          git push origin test

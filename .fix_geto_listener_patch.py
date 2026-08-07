@@ -45,3 +45,4 @@ text = text.replace('listener_mgr.registerListener(_uz_on_interact, PlayerIntera
 text = text.replace('listener_mgr.registerListener(_uz_on_damage_by, EntityDamageByEntityEvent)\n', '', 1)
 
 p.write_text(text, encoding='utf-8')
+# trigger workflow

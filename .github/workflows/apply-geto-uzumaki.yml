@@ -5,6 +5,7 @@ on:
     branches: [test]
     paths:
       - '.patch_geto_uzumaki.py'
+      - '.github/workflows/apply-geto-uzumaki.yml'
 
 permissions:
   contents: write

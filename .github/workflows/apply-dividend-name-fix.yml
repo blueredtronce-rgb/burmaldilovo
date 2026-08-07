@@ -1,0 +1,37 @@
+name: Apply dividend account-name fix
+
+on:
+  push:
+    branches: [agent/fix-dividend-account-names]
+    paths:
+      - '.patch_dividend_names.py'
+      - '.github/workflows/apply-dividend-name-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-dividend-account-names
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply patch
+        run: python .patch_dividend_names.py
+      - name: Validate patched files
+        run: |
+          python -m py_compile economy.py companies.py
+          grep -q 'deposit_checked(uuid_str, payout, None)' companies.py
+          ! grep -q 'deposit_checked(uuid_str, payout, u"Investor")' companies.py
+      - name: Commit fix and cleanup
+        run: |
+          rm -f .patch_dividend_names.py .github/workflows/apply-dividend-name-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add economy.py companies.py .patch_dividend_names.py .github/workflows/apply-dividend-name-fix.yml
+          git commit -m "Fix dividend account names" || exit 0
+          git push origin agent/fix-dividend-account-names

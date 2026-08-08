@@ -43,7 +43,7 @@
 
     Способность 3 — «Парирование»
       В течение 0,5 секунды Акаме входит в стойку.
-      Если за это время получает удар: полностью парирует атаку; атакующий получает Замедление III, Слепоту II на 0,8 секунды.
+      Если за это время получает удар: полностью парирует атаку; атакующий получает Замедление III, Слепоту II на 1 секунду.
       Перезарядка: 7 секунд.
 
     Способность 4 — «Рывок»
@@ -690,10 +690,10 @@ def _handle_parry_check(event):
                         except Exception:
                             pass
                     
-                    # Apply slowness and blindness to the attacker
+                    # Apply slowness and blindness to the attacker for 1 second.
                     if isinstance(damager, LivingEntity) or hasattr(damager, "addPotionEffect"):
-                        add_effect(damager, E_SLOWNESS, 16, 2)  # Slowness III (amp 2)
-                        add_effect(damager, E_BLINDNESS, 16, 1) # Blindness II (amp 1)
+                        add_effect(damager, E_SLOWNESS, 20, 2)  # Slowness III, 1.0 sec
+                        add_effect(damager, E_BLINDNESS, 20, 1) # Blindness II, 1.0 sec
                         try:
                             damager.sendMessage(u"§cТвоя атака была спарирована Акаме!")
                             damager.playSound(damager.getLocation(), Sound.ENTITY_ELDER_GUARDIAN_CURSE, 0.8, 1.5)

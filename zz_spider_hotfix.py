@@ -4,7 +4,9 @@ Temporary Agent-Spider hotfix for test-cg.
 
 Loads after agent_spider.py and patches its live globals without touching main/test:
 - replaces the red leather helmet with player head BigBoyeDuniel;
-- resolves and embeds BigBoyeDuniel's actual Mojang/Paper texture profile;
+- reads BigBoyeDuniel's ACTIVE skin property from SkinsRestorer (offline-mode safe);
+- embeds that signed textures property directly into the Paper player-head profile;
+- falls back to Paper/Mojang profile resolution only if SkinsRestorer data is unavailable;
 - restores Web Ball and Web Grenade as ejector modes 13 and 14;
 - keeps the current quest modes 0..12 unchanged.
 
@@ -18,6 +20,7 @@ from java.util import ArrayList
 from org.bukkit import Bukkit, Material
 from org.bukkit.inventory import ItemStack
 from org.bukkit.persistence import PersistentDataType
+from com.destroystokyo.paper.profile import ProfileProperty
 
 scheduler = ps.scheduler
 
@@ -57,48 +60,134 @@ def _get_spider_globals():
     return _function_globals(kit_fn)
 
 
-def _get_head_profile():
-    """Return a cached Paper PlayerProfile with UUID + actual skin texture."""
-    if _HEAD_PROFILE[0] is not None:
-        return _HEAD_PROFILE[0]
+def _skinsrestorer_api():
+    """Resolve the installed SkinsRestorer API, with classloader fallback for PySpigot."""
     try:
-        # Paper 1.21.11 createProfile(name) creates a profile shell. complete(True)
-        # performs the profile lookup and fills UUID/name/textures.
+        from net.skinsrestorer.api import SkinsRestorerProvider
+        return SkinsRestorerProvider.get()
+    except Exception as direct_ex:
+        try:
+            plugin = Bukkit.getPluginManager().getPlugin("SkinsRestorer")
+            if plugin is None:
+                Bukkit.getLogger().warning("[spider_hotfix] SkinsRestorer plugin not found")
+                return None
+            loader = plugin.getClass().getClassLoader()
+            provider_cls = loader.loadClass("net.skinsrestorer.api.SkinsRestorerProvider")
+            # Java reflection varargs are awkward from Jython; getDeclaredMethods avoids
+            # constructing a Class[] just to call the public static no-arg get().
+            for method in provider_cls.getDeclaredMethods():
+                if method.getName() == "get" and method.getParameterTypes().length == 0:
+                    return method.invoke(None)
+            Bukkit.getLogger().warning("[spider_hotfix] SkinsRestorerProvider.get() not found")
+        except Exception as reflect_ex:
+            Bukkit.getLogger().warning(
+                "[spider_hotfix] SkinsRestorer API unavailable: " + str(reflect_ex)
+            )
+    return None
+
+
+def _profile_from_skinsrestorer():
+    """Build a Paper profile from the exact SkinProperty SkinsRestorer applies in offline mode."""
+    try:
+        api = _skinsrestorer_api()
+        if api is None:
+            return None
+
+        offline = Bukkit.getOfflinePlayer(HEAD_OWNER)
+        owner_uuid = offline.getUniqueId()
+        player_storage = api.getPlayerStorage()
+
+        # Explicit isOnlineMode=False is important: this server runs offline-mode and
+        # SkinsRestorer may have a custom/default/url skin linked to the offline UUID.
+        optional = player_storage.getSkinForPlayer(owner_uuid, HEAD_OWNER, False)
+        if optional is None or not optional.isPresent():
+            # If a player has a directly linked skin identifier, this path can still
+            # retrieve it without asking providers for a new Mojang profile.
+            try:
+                optional = player_storage.getSkinOfPlayer(owner_uuid)
+            except Exception:
+                pass
+
+        if optional is None or not optional.isPresent():
+            Bukkit.getLogger().warning(
+                "[spider_hotfix] SkinsRestorer has no stored skin for " + HEAD_OWNER
+            )
+            return None
+
+        skin_property = optional.get()
+        value = skin_property.getValue()
+        signature = skin_property.getSignature()
+        if value is None or len(str(value)) == 0:
+            Bukkit.getLogger().warning(
+                "[spider_hotfix] SkinsRestorer returned empty texture value for " + HEAD_OWNER
+            )
+            return None
+
+        profile = Bukkit.createProfileExact(owner_uuid, HEAD_OWNER)
+        profile.clearProperties()
+        if signature is None or len(str(signature)) == 0:
+            profile.setProperty(ProfileProperty("textures", value))
+        else:
+            profile.setProperty(ProfileProperty("textures", value, signature))
+
+        Bukkit.getLogger().info(
+            "[spider_hotfix] loaded " + HEAD_OWNER + " texture from SkinsRestorer"
+        )
+        return profile
+    except Exception as ex:
+        Bukkit.getLogger().warning(
+            "[spider_hotfix] failed to read SkinsRestorer skin for " + HEAD_OWNER + ": " + str(ex)
+        )
+        return None
+
+
+def _profile_from_paper_fallback():
+    """Fallback for premium/Mojang-backed accounts when SR data is unavailable."""
+    try:
         profile = Bukkit.createProfile(HEAD_OWNER)
         try:
             complete = profile.isComplete()
         except Exception:
             complete = False
         if not complete:
-            ok = profile.complete(True)
-            if not ok:
-                Bukkit.getLogger().warning(
-                    "[spider_hotfix] could not complete skin profile for " + HEAD_OWNER
-                )
-        _HEAD_PROFILE[0] = profile
+            try:
+                profile.complete(True)
+            except Exception:
+                pass
         return profile
     except Exception as ex:
         Bukkit.getLogger().warning(
-            "[spider_hotfix] failed to resolve skin profile for " + HEAD_OWNER + ": " + str(ex)
+            "[spider_hotfix] Paper fallback profile failed for " + HEAD_OWNER + ": " + str(ex)
         )
         return None
+
+
+def _get_head_profile():
+    if _HEAD_PROFILE[0] is not None:
+        return _HEAD_PROFILE[0]
+
+    profile = _profile_from_skinsrestorer()
+    if profile is None:
+        profile = _profile_from_paper_fallback()
+
+    if profile is not None:
+        _HEAD_PROFILE[0] = profile
+    return profile
 
 
 def _apply_head_profile(meta):
     profile = _get_head_profile()
     if profile is not None:
         try:
-            # SkullMeta#setPlayerProfile stores the supplied profile including textures.
             meta.setPlayerProfile(profile)
             return True
         except Exception as ex:
             Bukkit.getLogger().warning("[spider_hotfix] setPlayerProfile failed: " + str(ex))
-    # Last-resort fallback: still provide an owned player head.
     try:
         meta.setOwningPlayer(Bukkit.getOfflinePlayer(HEAD_OWNER))
-        return False
     except Exception:
-        return False
+        pass
+    return False
 
 
 def _install():
@@ -240,7 +329,7 @@ def _install():
         pass
 
     Bukkit.getLogger().info(
-        "[spider_hotfix] installed: textured BigBoyeDuniel head + Web Ball + Web Grenade"
+        "[spider_hotfix] installed: SkinsRestorer-backed BigBoyeDuniel head + Web Ball + Web Grenade"
     )
     return True
 

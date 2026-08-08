@@ -256,7 +256,7 @@ def reject_json_constant(value):
 # -----------------------------------------------------------------------------
 class EconomyConfig:
     PLUGIN_NAME = u"SmartY-Economy"
-    VERSION = u"3.8.0"
+    VERSION = u"3.8.1"
     PREFIX = u"&a&l[\u042d\u043a\u043e\u043d\u043e\u043c\u0438\u043a\u0430]&r "
 
     DEFAULT_BALANCE = 100.0
@@ -816,6 +816,7 @@ class EconomyManager(object):
         self.payday_amount = float(EconomyConfig.DEFAULT_PAYDAY_AMOUNT)
         self.payday_afk_threshold = float(EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
         self.sleep_defaults = {}
+        self.processed_batch_operations = {}
         self._database_loaded = self.load_database()
 
     def _published_manager(self):
@@ -884,6 +885,7 @@ class EconomyManager(object):
         loaded_accounts = {}
         loaded_names = {}
         loaded_sleep_defaults = {}
+        loaded_processed_batch_operations = {}
         try:
             for uuid_str, acc_dict in data.get("accounts", {}).items():
                 if not isinstance(acc_dict, dict):
@@ -897,6 +899,15 @@ class EconomyManager(object):
                     loaded_names[acc.name.lower()] = str(uuid_str)
             for world_name, percent in (data.get("sleep_defaults", {}) or {}).items():
                 loaded_sleep_defaults[to_unicode(world_name)] = max(1, min(100, int(percent)))
+            raw_batch_operations = data.get("processed_batch_operations", {}) or {}
+            if isinstance(raw_batch_operations, dict):
+                for operation_id, processed_at in raw_batch_operations.items():
+                    try:
+                        operation_key = to_unicode(operation_id).strip()
+                        if operation_key:
+                            loaded_processed_batch_operations[operation_key] = int(processed_at)
+                    except Exception:
+                        pass
         except Exception as exc:
             log_error(u"Economy database validation failed: {0}".format(exc))
             return False
@@ -909,18 +920,20 @@ class EconomyManager(object):
             self.payday_amount = safe_amount(data.get("payday_amount", EconomyConfig.DEFAULT_PAYDAY_AMOUNT), default=EconomyConfig.DEFAULT_PAYDAY_AMOUNT)
             self.payday_afk_threshold = safe_amount(data.get("payday_afk_threshold", EconomyConfig.DEFAULT_PAYDAY_INACTIVITY), default=EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
             self.sleep_defaults = loaded_sleep_defaults
+            self.processed_batch_operations = loaded_processed_batch_operations
         finally:
             self._lock.release()
         return True
 
     def _database_payload(self):
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "saved_at": int(time.time()),
             "jackpot_bank": round(safe_amount(self.jackpot_bank, 0.0), 2),
             "payday_amount": round(float(self.payday_amount), 2),
             "payday_afk_threshold": round(float(self.payday_afk_threshold), 1),
             "sleep_defaults": {str(wn): int(pct) for wn, pct in self.sleep_defaults.items()},
+            "processed_batch_operations": dict(self.processed_batch_operations),
             "accounts": {uuid_str: acc.to_dict() for uuid_str, acc in self.accounts.items()}
         }
 
@@ -1149,6 +1162,85 @@ class EconomyManager(object):
         update_online_player_hud(uuid_key)
         invalidate_baltop_cache()
         return True, acc.balance
+
+    def deposit_batch_once(self, operation_id, payouts):
+        """Atomically credit a dividend batch exactly once.
+
+        Returns (success, already_processed). Operation IDs are persisted in
+        economy.json in the same atomic save as balances, so Companies may
+        safely retry a pending dividend after reload/crash without duplicating it.
+        """
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            if hasattr(manager, "deposit_batch_once"):
+                return manager.deposit_batch_once(operation_id, payouts)
+            return False, False
+        if manager is None:
+            return False, False
+
+        operation_key = to_unicode(operation_id).strip() if operation_id is not None else u""
+        if not operation_key or not isinstance(payouts, (list, tuple)) or not payouts:
+            return False, False
+
+        normalized = []
+        for item in payouts:
+            try:
+                uuid_key = str(item[0]).strip()
+                amount = safe_amount(item[1], default=None)
+                supplied_name = item[2] if len(item) >= 3 else None
+            except Exception:
+                return False, False
+            if not uuid_key or amount is None or amount <= 0.0:
+                return False, False
+            normalized.append((uuid_key, float(amount), supplied_name))
+
+        touched = set()
+        self._lock.acquire()
+        try:
+            if operation_key in self.processed_batch_operations:
+                return True, True
+
+            old_name_to_uuid = dict(self.name_to_uuid)
+            snapshots = {}
+            created_uuids = set()
+
+            def rollback():
+                self.processed_batch_operations.pop(operation_key, None)
+                self.name_to_uuid = old_name_to_uuid
+                for key in created_uuids:
+                    self.accounts.pop(key, None)
+                for key, values in snapshots.items():
+                    if key in created_uuids:
+                        continue
+                    acc = self.accounts.get(key)
+                    if acc is not None:
+                        acc.balance, acc.last_seen = values
+
+            for uuid_key, amount, supplied_name in normalized:
+                credit_name = self._name_for_new_credit_account(uuid_key, supplied_name)
+                acc, created = self._get_or_create_in_memory(uuid_key, credit_name, update_name=False)
+                if uuid_key not in snapshots:
+                    snapshots[uuid_key] = (acc.balance, acc.last_seen)
+                if created:
+                    created_uuids.add(uuid_key)
+                new_balance = acc.balance + amount
+                if new_balance > EconomyConfig.MAX_BALANCE:
+                    rollback()
+                    return False, False
+                acc.balance = round(new_balance, 2)
+                touched.add(uuid_key)
+
+            self.processed_batch_operations[operation_key] = int(time.time())
+            if not self.save_database():
+                rollback()
+                return False, False
+        finally:
+            self._lock.release()
+
+        for uuid_key in touched:
+            update_online_player_hud(uuid_key)
+        invalidate_baltop_cache()
+        return True, False
 
     def deposit(self, uuid_str, amount, name=None):
         success, balance = self.deposit_checked(uuid_str, amount, name)
@@ -1436,10 +1528,28 @@ def broadcast_plain(message):
     safe_console_send(line)
 
 
+HIDDEN_SESSIONS_PROPERTY = u"SmartY_Hidden_ActiveSessions"
+
+
+def is_hidden_admin(player):
+    """True only while /hidden is active in this exact online session."""
+    if player is None or not JAVA_STRING_AVAILABLE or System is None:
+        return False
+    try:
+        sessions = System.getProperties().get(HIDDEN_SESSIONS_PROPERTY)
+        if sessions is None:
+            return False
+        return str(player.getUniqueId()) in sessions
+    except Exception:
+        return False
+
+
 def is_player_afk(player):
     if player is None:
         return False
     try:
+        if is_hidden_admin(player):
+            return False
         return bool(afk_players.get(str(player.getUniqueId()), False))
     except Exception:
         return False
@@ -1575,8 +1685,14 @@ def set_player_afk(player, value, automatic=False):
         uuid_str, name = get_sender_uuid_and_name(player)
         if not uuid_str:
             return False
-        current = bool(afk_players.get(uuid_str, False))
         value = bool(value)
+        if value and is_hidden_admin(player):
+            # Hidden staff never enters AFK, neither automatically nor via /afk.
+            afk_players.pop(uuid_str, None)
+            last_activity[uuid_str] = time.time()
+            last_location_keys[uuid_str] = get_location_key(player.getLocation())
+            return False
+        current = bool(afk_players.get(uuid_str, False))
         if current == value:
             return False
 
@@ -1633,6 +1749,13 @@ class AfkRunnable(Runnable):
                     continue
                 uuid_str, name = get_sender_uuid_and_name(player)
                 if not uuid_str:
+                    continue
+                if is_hidden_admin(player):
+                    # Keep the activity clock fresh as well: payday must not be
+                    # frozen by the secondary inactivity guard while hidden.
+                    afk_players.pop(uuid_str, None)
+                    last_activity[uuid_str] = now
+                    last_location_keys[uuid_str] = get_location_key(player.getLocation())
                     continue
                 if uuid_str not in last_activity:
                     last_activity[uuid_str] = now
@@ -1876,6 +1999,9 @@ def _is_recently_active(uuid_str, now, threshold=None):
             threshold = float(EconomyManager().payday_afk_threshold)
         except Exception:
             threshold = float(EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
+    hidden_player = get_online_player_by_uuid(uuid_str)
+    if hidden_player is not None and is_hidden_admin(hidden_player):
+        return True
     la = last_activity.get(uuid_str)
     if la is None:
         return False

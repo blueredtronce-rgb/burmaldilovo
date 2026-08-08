@@ -79,12 +79,13 @@ except ImportError:
     AsyncPlayerChatEvent = None
 
 try:
-    from java.lang import String as JavaString, StringBuilder
+    from java.lang import String as JavaString, StringBuilder, System
     JAVA_STRING_AVAILABLE = True
 except ImportError:
     JAVA_STRING_AVAILABLE = False
     JavaString = str
     StringBuilder = None
+    System = None
 
 
 # -----------------------------------------------------------------------------
@@ -95,8 +96,9 @@ except ImportError:
 ALLOWED_NAMES = set([u"blueredtronce", u"dramo_smarty"])
 
 PLUGIN_NAME = u"SmartY-HiddenMode"
-VERSION = u"1.0.0"
+VERSION = u"1.0.1"
 PREFIX = u"&8[&7Hidden&8]&r "
+HIDDEN_SESSIONS_PROPERTY = u"SmartY_Hidden_ActiveSessions"
 
 
 # -----------------------------------------------------------------------------
@@ -321,6 +323,21 @@ storage = HiddenModeStorage()
 active_hidden_sessions = set()
 
 
+def publish_active_hidden_sessions():
+    """Expose the live hidden-session set to sibling PySpigot scripts.
+
+    This is intentionally the in-memory active set, not hidden_mode.json's
+    "armed for next login" value. Storing the same mutable set object means
+    joins/reveals/quits are visible immediately without cross-script imports.
+    """
+    if not JAVA_STRING_AVAILABLE or System is None:
+        return
+    try:
+        System.getProperties().put(HIDDEN_SESSIONS_PROPERTY, active_hidden_sessions)
+    except Exception as e:
+        log_error(u"Failed to publish active hidden sessions: {0}".format(e))
+
+
 # -----------------------------------------------------------------------------
 # ВИЗУАЛЬНОЕ СКРЫТИЕ / ПОКАЗ ИГРОКА (Tab + мир одним вызовом hidePlayer)
 # -----------------------------------------------------------------------------
@@ -536,6 +553,7 @@ def register_commands():
 def on_enable():
     log_info("Starting SmartY-HiddenMode v{0}".format(VERSION))
     storage.load()
+    publish_active_hidden_sessions()
     register_listeners()
     register_commands()
     log_info("Enabled. Allowed players count: {0}".format(len(ALLOWED_NAMES)))

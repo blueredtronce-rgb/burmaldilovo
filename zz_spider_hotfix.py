@@ -4,6 +4,7 @@ Temporary Agent-Spider hotfix for test-cg.
 
 Loads after agent_spider.py and patches its live globals without touching main/test:
 - replaces the red leather helmet with player head BigBoyeDuniel;
+- resolves and embeds BigBoyeDuniel's actual Mojang/Paper texture profile;
 - restores Web Ball and Web Grenade as ejector modes 13 and 14;
 - keeps the current quest modes 0..12 unchanged.
 
@@ -22,6 +23,7 @@ scheduler = ps.scheduler
 
 HEAD_OWNER = u"BigBoyeDuniel"
 REGISTRY_KEY = "pyspigot.character_kits"
+_HEAD_PROFILE = [None]
 
 
 def _java_list(values):
@@ -32,7 +34,6 @@ def _java_list(values):
 
 
 def _function_globals(fn):
-    # Jython 2.7 normally exposes func_globals; __globals__ is kept as fallback.
     try:
         return fn.func_globals
     except Exception:
@@ -54,6 +55,50 @@ def _get_spider_globals():
     except Exception:
         kit_fn = entry
     return _function_globals(kit_fn)
+
+
+def _get_head_profile():
+    """Return a cached Paper PlayerProfile with UUID + actual skin texture."""
+    if _HEAD_PROFILE[0] is not None:
+        return _HEAD_PROFILE[0]
+    try:
+        # Paper 1.21.11 createProfile(name) creates a profile shell. complete(True)
+        # performs the profile lookup and fills UUID/name/textures.
+        profile = Bukkit.createProfile(HEAD_OWNER)
+        try:
+            complete = profile.isComplete()
+        except Exception:
+            complete = False
+        if not complete:
+            ok = profile.complete(True)
+            if not ok:
+                Bukkit.getLogger().warning(
+                    "[spider_hotfix] could not complete skin profile for " + HEAD_OWNER
+                )
+        _HEAD_PROFILE[0] = profile
+        return profile
+    except Exception as ex:
+        Bukkit.getLogger().warning(
+            "[spider_hotfix] failed to resolve skin profile for " + HEAD_OWNER + ": " + str(ex)
+        )
+        return None
+
+
+def _apply_head_profile(meta):
+    profile = _get_head_profile()
+    if profile is not None:
+        try:
+            # SkullMeta#setPlayerProfile stores the supplied profile including textures.
+            meta.setPlayerProfile(profile)
+            return True
+        except Exception as ex:
+            Bukkit.getLogger().warning("[spider_hotfix] setPlayerProfile failed: " + str(ex))
+    # Last-resort fallback: still provide an owned player head.
+    try:
+        meta.setOwningPlayer(Bukkit.getOfflinePlayer(HEAD_OWNER))
+        return False
+    except Exception:
+        return False
 
 
 def _install():
@@ -79,7 +124,6 @@ def _install():
         meta.getPersistentDataContainer().set(key, PersistentDataType.BYTE, JByte(1))
 
     def create_mask_hotfix():
-        # PLAYER_HEAD has no armor attribute, unlike the previous leather helmet.
         item = ItemStack(Material.PLAYER_HEAD, 1)
         meta = item.getItemMeta()
         meta.setDisplayName(u"§c§lМаска Агент-Паука")
@@ -90,10 +134,7 @@ def _install():
             u"§8Не даёт очков брони.",
             u"§8Обязательна для использования способностей.",
         ]))
-        try:
-            meta.setOwningPlayer(Bukkit.getOfflinePlayer(HEAD_OWNER))
-        except Exception as ex:
-            Bukkit.getLogger().warning("[spider_hotfix] player-head profile: " + str(ex))
+        _apply_head_profile(meta)
         _set_flag(meta, key_mask)
         item.setItemMeta(meta)
         return item
@@ -139,7 +180,6 @@ def _install():
             ]))
             item.setItemMeta(meta)
 
-    # Preserve all modern modes and append the two accidentally lost legacy modes.
     g["MODE_INFO"][13] = (u"Паутинный шар", u"§f")
     g["MODE_INFO"][14] = (u"Паутинная граната", u"§a")
     g["MODE_MAX"] = 14
@@ -164,8 +204,6 @@ def _install():
                 return
             if not g["_try_consume_ammo"](player, u"эжектора"):
                 return
-            # do_web_ball launches projectile id 2; current hit handler still contains
-            # the original Web Ball effect for projectile id 2.
             g["do_web_ball"](player)
             return
 
@@ -174,9 +212,6 @@ def _install():
                 return
             if not g["_try_consume_ammo"](player, u"эжектора"):
                 return
-            # The legacy helper now launches id 4, which was reassigned to Spider Lunge.
-            # Launch id 14 directly because the current hit handler already contains
-            # the correct grenade implementation under mode 14.
             g["launch_web"](player, 14, 1.6)
             g["set_cd"](player, "grenade", g["CD_GRENADE"])
             return
@@ -185,10 +220,7 @@ def _install():
         item = ItemStack(Material.PLAYER_HEAD, 1)
         meta = item.getItemMeta()
         meta.setDisplayName(u"§cМаска Агент-Паука")
-        try:
-            meta.setOwningPlayer(Bukkit.getOfflinePlayer(HEAD_OWNER))
-        except Exception:
-            pass
+        _apply_head_profile(meta)
         item.setItemMeta(meta)
         return item
 
@@ -198,7 +230,6 @@ def _install():
     g["fire_ejector"] = fire_ejector_hotfix
     g["_spider_mirror_mask"] = mirror_mask_hotfix
 
-    # Refresh Archer mirror catalog entry if it is already published.
     try:
         mirror_cat = System.getProperties().get("archer.mirror_catalog")
         if mirror_cat is not None:
@@ -209,12 +240,11 @@ def _install():
         pass
 
     Bukkit.getLogger().info(
-        "[spider_hotfix] installed: BigBoyeDuniel head + Web Ball + Web Grenade"
+        "[spider_hotfix] installed: textured BigBoyeDuniel head + Web Ball + Web Grenade"
     )
     return True
 
 
-# Scripts are usually loaded alphabetically; the delayed retries also make reload order safe.
 def _try_install(attempt=[0]):
     if _install():
         return

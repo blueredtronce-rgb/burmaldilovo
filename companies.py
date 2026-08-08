@@ -242,6 +242,43 @@ def parse_int(raw):
     return value
 
 
+def allocate_dividend_payouts(amount, shares_by_uuid):
+    """Returns an exact, proportional cent allocation using largest remainders."""
+    amount_cents = int(round(float(amount) * 100.0))
+    clean_shares = []
+    for uuid_str, shares in (shares_by_uuid or {}).items():
+        try:
+            share_count = int(shares)
+        except Exception:
+            share_count = 0
+        if share_count > 0:
+            clean_shares.append((str(uuid_str), share_count))
+    clean_shares.sort(key=lambda item: item[0])
+    total_shares = sum([item[1] for item in clean_shares])
+    if amount_cents <= 0 or total_shares <= 0:
+        return []
+
+    rows = []
+    assigned_cents = 0
+    for uuid_str, share_count in clean_shares:
+        numerator = amount_cents * share_count
+        payout_cents = numerator // total_shares
+        remainder = numerator % total_shares
+        rows.append([uuid_str, payout_cents, remainder])
+        assigned_cents += payout_cents
+
+    remaining_cents = amount_cents - assigned_cents
+    remainder_order = sorted(rows, key=lambda row: (-row[2], row[0]))
+    for index in range(remaining_cents):
+        remainder_order[index][1] += 1
+
+    payouts = []
+    for uuid_str, payout_cents, unused_remainder in rows:
+        if payout_cents > 0:
+            payouts.append([uuid_str, float(payout_cents) / 100.0, u"Investor"])
+    return payouts
+
+
 def get_sender_uuid_and_name(sender):
     if sender is None or not hasattr(sender, "getUniqueId"):
         return None, u"Console"
@@ -290,21 +327,20 @@ def get_pyspigot_plugin():
 
 class CompaniesConfig(object):
     PLUGIN_NAME = u"SmartY-Companies"
-    VERSION = u"1.2.0"
+    VERSION = u"1.3.0"
     PREFIX = u"&3&l[Предприятия]&r "
     SHARES_TOTAL = 10000
     MAX_OWNER_COMPANIES = 10
     MIN_SHARE_PRICE = 10.0
     MAX_START_SHARE_PRICE = 100000.0
     DEFAULT_TAX_PERCENT = 2.0
-    DIVIDEND_INTERVAL_SECONDS = 24 * 60 * 60
-    DIVIDEND_TASK_PERIOD_TICKS = 1200
+    # Test mode: switch this to 86400 for one payout per day.
+    DIVIDEND_INTERVAL_SECONDS = 300
+    DIVIDEND_SCHEDULE_VERSION = DIVIDEND_INTERVAL_SECONDS
+    DIVIDEND_TASK_INITIAL_DELAY_TICKS = 20
+    DIVIDEND_TASK_PERIOD_TICKS = 100
     LIST_PAGE_SIZE = 45
     OFFER_TIMEOUT_SECONDS = 300
-    OPERATION_HISTORY_LIMIT = 300
-    PRICE_HISTORY_DAYS = 30
-    LARGE_WITHDRAW_PERCENT = 20.0
-    WITHDRAW_VOTE_SECONDS = 24 * 60 * 60
 
     SCRIPT_DIR = get_script_dir()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
@@ -498,6 +534,11 @@ class EconomyGateway(object):
             return self.manager.deposit_checked(uuid_str, amount, name)
         return True, self.manager.deposit(uuid_str, amount, name)
 
+    def deposit_batch_once(self, operation_id, payouts):
+        if not self.is_ready() or not hasattr(self.manager, "deposit_batch_once"):
+            return False, False
+        return self.manager.deposit_batch_once(operation_id, payouts)
+
     def transfer(self, from_uuid, to_uuid, amount, to_name):
         if not self.is_ready() or not hasattr(self.manager, "transfer"):
             return False, 0.0, 0.0
@@ -637,12 +678,7 @@ class TownGateway(object):
 
 
 class CompanyState(object):
-    DEFAULTS = {
-        "companies": {}, "offers": {}, "next_offer_id": 1,
-        "operation_journal": {}, "operation_history": [],
-        "next_operation_id": 1, "withdraw_votes": {}, "next_vote_id": 1,
-        "limit_orders": {}, "next_limit_order_id": 1
-    }
+    DEFAULTS = {"companies": {}, "offers": {}, "next_offer_id": 1}
 
     def __init__(self, storage):
         self.storage = storage
@@ -652,18 +688,15 @@ class CompanyState(object):
 
     def normalize(self):
         changed = False
+        now = int(time.time())
         self.data.setdefault("companies", {})
         self.data.setdefault("offers", {})
         self.data.setdefault("next_offer_id", 1)
-        self.data.setdefault("operation_journal", {})
-        self.data.setdefault("operation_history", [])
-        self.data.setdefault("next_operation_id", 1)
-        self.data.setdefault("withdraw_votes", {})
-        self.data.setdefault("next_vote_id", 1)
-        self.data.setdefault("limit_orders", {})
-        self.data.setdefault("next_limit_order_id", 1)
-        now = int(time.time())
         for company in self.data.get("companies", {}).values():
+            try:
+                stored_schedule_version = int(company.get("dividend_schedule_version", 0))
+            except Exception:
+                stored_schedule_version = 0
             defaults = {
                 "id": new_id(),
                 "name": u"Company",
@@ -672,25 +705,15 @@ class CompanyState(object):
                 "owner_uuid": "",
                 "owner_name": u"Unknown",
                 "town": u"",
-                "next_dividend_at": int(time.time() + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS),
+                "next_dividend_at": now + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS,
+                "dividend_schedule_version": CompaniesConfig.DIVIDEND_SCHEDULE_VERSION,
+                "pending_dividend": None,
                 "created_at": int(time.time()),
                 "updated_at": int(time.time())
             }
             for key, value in defaults.items():
                 if key not in company:
                     company[key] = value
-                    changed = True
-            # Старые записи могли ждать ещё трое суток. После миграции первая
-            # выплата наступает не позже чем через 24 часа.
-            if int(company.get("next_dividend_at", 0)) > now + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS:
-                company["next_dividend_at"] = now + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS
-                changed = True
-            for key, value in (
-                ("transaction_history", []), ("daily_ohlc", {}),
-                ("bankrupt", False), ("bankrupt_at", 0)
-            ):
-                if key not in company:
-                    company[key] = copy.deepcopy(value)
                     changed = True
             normalized_key = normalize_key(company.get("key") or company.get("name"))
             if company.get("key") != normalized_key:
@@ -712,6 +735,17 @@ class CompanyState(object):
                 changed = True
             if company.get("dividends") != dividends:
                 company["dividends"] = dividends
+                changed = True
+            try:
+                normalized_next_dividend = int(company.get("next_dividend_at", 0) or 0)
+            except Exception:
+                normalized_next_dividend = now + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS if dividends > 0 else 0
+            if company.get("next_dividend_at") != normalized_next_dividend:
+                company["next_dividend_at"] = normalized_next_dividend
+                changed = True
+            if stored_schedule_version != CompaniesConfig.DIVIDEND_SCHEDULE_VERSION:
+                company["dividend_schedule_version"] = CompaniesConfig.DIVIDEND_SCHEDULE_VERSION
+                company["next_dividend_at"] = now + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS if dividends > 0 else 0
                 changed = True
             if company.get("total_shares") != CompaniesConfig.SHARES_TOTAL:
                 company["total_shares"] = CompaniesConfig.SHARES_TOTAL
@@ -759,7 +793,6 @@ class CompanyState(object):
         try:
             for company in self.data.get("companies", {}).values():
                 company["share_price"] = calculate_company_share_price(company)
-                self.record_quote(company, company["share_price"])
             return bool(self.storage.save(self.data))
         finally:
             self.lock.release()
@@ -804,6 +837,8 @@ class CompanyState(object):
             "shares": {},
             "dividends": 0.0,
             "next_dividend_at": now + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS,
+            "dividend_schedule_version": CompaniesConfig.DIVIDEND_SCHEDULE_VERSION,
+            "pending_dividend": None,
             "created_at": now,
             "updated_at": now
         }
@@ -848,77 +883,22 @@ class CompanyState(object):
         self.data["next_offer_id"] = offer_id + 1
         return str(offer_id)
 
-    def record_quote(self, company, price):
-        day = time.strftime("%Y-%m-%d", time.localtime())
-        history = company.setdefault("daily_ohlc", {})
-        candle = history.get(day)
-        price = round(float(price), 6)
-        if candle is None:
-            history[day] = {"open": price, "high": price, "low": price, "close": price}
-        else:
-            candle["high"] = max(float(candle.get("high", price)), price)
-            candle["low"] = min(float(candle.get("low", price)), price)
-            candle["close"] = price
-        if len(history) > CompaniesConfig.PRICE_HISTORY_DAYS:
-            for old_day in sorted(history.keys())[:-CompaniesConfig.PRICE_HISTORY_DAYS]:
-                history.pop(old_day, None)
-
-    def begin_operation(self, operation, payload):
-        op_id = str(self.data.get("next_operation_id", 1))
-        self.data["next_operation_id"] = int(op_id) + 1
-        entry = {
-            "id": op_id, "operation": str(operation), "status": "prepared",
-            "created_at": int(time.time()), "payload": copy.deepcopy(payload)
-        }
-        self.data.setdefault("operation_journal", {})[op_id] = entry
-        if not self.save():
-            self.data["operation_journal"].pop(op_id, None)
-            return None
-        return op_id
-
-    def complete_operation(self, op_id, result=None):
-        entry = self.data.setdefault("operation_journal", {}).pop(str(op_id), None)
-        if entry is None:
-            return False
-        entry["status"] = "completed"
-        entry["completed_at"] = int(time.time())
-        if result is not None:
-            entry["result"] = copy.deepcopy(result)
-        history = self.data.setdefault("operation_history", [])
-        history.append(entry)
-        if len(history) > CompaniesConfig.OPERATION_HISTORY_LIMIT:
-            del history[:-CompaniesConfig.OPERATION_HISTORY_LIMIT]
-        return self.save()
-
-    def fail_operation(self, op_id, reason):
-        entry = self.data.setdefault("operation_journal", {}).pop(str(op_id), None)
-        if entry is None:
-            return False
-        entry["status"] = "failed"
-        entry["completed_at"] = int(time.time())
-        entry["reason"] = to_unicode(reason)
-        history = self.data.setdefault("operation_history", [])
-        history.append(entry)
-        if len(history) > CompaniesConfig.OPERATION_HISTORY_LIMIT:
-            del history[:-CompaniesConfig.OPERATION_HISTORY_LIMIT]
-        return self.save()
-
-    def add_company_history(self, company, operation, actor, amount=0.0, details=None):
-        history = company.setdefault("transaction_history", [])
-        history.append({
-            "time": int(time.time()), "operation": str(operation),
-            "actor": to_unicode(actor), "amount": round(float(amount), 2),
-            "details": to_unicode(details or u"")
-        })
-        if len(history) > CompaniesConfig.OPERATION_HISTORY_LIMIT:
-            del history[:-CompaniesConfig.OPERATION_HISTORY_LIMIT]
-
 
 class CompanyService(object):
     def __init__(self, state, economy, towns):
         self.state = state
         self.economy = economy
         self.towns = towns
+        self.dividend_lock = threading.RLock()
+        self.dividend_processing = False
+        self.dividend_error_log_at = {}
+
+    def log_dividend_error(self, operation_id, message):
+        key = str(operation_id or "unknown")
+        now = int(time.time())
+        if now - int(self.dividend_error_log_at.get(key, 0)) >= 60:
+            log_info(message)
+            self.dividend_error_log_at[key] = now
 
     def type_label(self, type_key):
         for item in CompaniesConfig.COMPANY_TYPES:
@@ -928,30 +908,6 @@ class CompanyService(object):
 
     def current_price(self, company):
         return calculate_company_share_price(company)
-
-    def is_tradable(self, player, company):
-        if company.get("bankrupt"):
-            send_message(player, CompaniesConfig.PREFIX + u"&cПредприятие находится в банкротстве; торговля акциями остановлена.")
-            return False
-        return True
-
-    def reserved_shares(self, company, uuid_str, exclude_offer_id=None):
-        reserved = 0
-        for offer_id, offer in self.state.data.setdefault("offers", {}).items():
-            if exclude_offer_id is not None and str(offer_id) == str(exclude_offer_id):
-                continue
-            if str(offer.get("company_key")) == str(company.get("key")) and \
-                    str(offer.get("seller_uuid")) == str(uuid_str) and \
-                    int(offer.get("expires_at", 0)) >= int(time.time()):
-                reserved += max(0, int(offer.get("amount", 0)))
-        for order in self.state.data.setdefault("limit_orders", {}).values():
-            if order.get("side") == "sell" and str(order.get("company_key")) == str(company.get("key")) and \
-                    str(order.get("player_uuid")) == str(uuid_str):
-                reserved += max(0, int(order.get("amount", 0)))
-        return reserved
-
-    def available_owned_shares(self, company, uuid_str, exclude_offer_id=None):
-        return max(0, self.owned_shares(company, uuid_str) - self.reserved_shares(company, uuid_str, exclude_offer_id))
 
     def marginal_buy_cost(self, company, amount):
         amount = int(amount)
@@ -1002,8 +958,6 @@ class CompanyService(object):
         company.update(snapshot)
 
     def save_company_change(self, player, company, snapshot, operation):
-        actor = get_sender_uuid_and_name(player)[1] if player is not None else u"System"
-        self.state.add_company_history(company, operation, actor)
         if self.state.save():
             return True
         self.restore_company(company, snapshot)
@@ -1024,11 +978,6 @@ class CompanyService(object):
             return 0.0
         success, treasury = self.towns.add_tax_checked(company.get("town"), tax)
         if success:
-            self.state.add_company_history(
-                company, "town_tax", payer_name or u"System", tax,
-                u"Казна города {0}".format(company.get("town")))
-            if not self.state.save():
-                log_info(u"Town tax was credited, but company audit could not be saved: {0}".format(company.get("name")))
             return tax
         log_info(u"Town tax storage failed for {0}, tax={1}".format(company.get("name"), tax))
         if payer_uuid is not None:
@@ -1089,8 +1038,6 @@ class CompanyService(object):
         if not company:
             send_message(player, CompaniesConfig.PREFIX + u"&cПредприятие не найдено.")
             return
-        if not self.is_tradable(player, company):
-            return
         if str(company.get("owner_uuid")) == str(uuid_str):
             send_message(player, CompaniesConfig.PREFIX + u"&cВладелец не может покупать акции своей компании.")
             return
@@ -1104,16 +1051,7 @@ class CompanyService(object):
         tax = self.calculate_tax(company, subtotal, "primary")
         total = round(subtotal + tax, 2)
         old_price = price
-        op_id = self.state.begin_operation("primary_buy", {
-            "company": company.get("key"), "buyer_uuid": uuid_str,
-            "buyer_name": player_name, "shares": amount, "subtotal": subtotal,
-            "tax": tax, "total": total
-        })
-        if op_id is None:
-            send_message(player, CompaniesConfig.PREFIX + u"&cСделка не начата: журнал операций недоступен.")
-            return
         if not self.economy.withdraw(uuid_str, total):
-            self.state.fail_operation(op_id, "withdraw failed")
             send_message(player, CompaniesConfig.PREFIX + u"&cНе удалось списать &e{0}&c. Проверьте баланс и работу экономики.".format(format_currency(total)))
             return
         snapshot = self.snapshot_company(company)
@@ -1122,10 +1060,8 @@ class CompanyService(object):
         self.add_shares(company, uuid_str, amount)
         if not self.save_company_change(player, company, snapshot, "primary buy"):
             self.refund_player(uuid_str, total, player_name, u"primary buy rollback")
-            self.state.fail_operation(op_id, "company save failed")
             return
         applied_tax = self.collect_town_tax(company, tax, uuid_str, player_name)
-        self.state.complete_operation(op_id, {"applied_tax": applied_tax, "new_price": self.current_price(company)})
         new_price = self.current_price(company)
         send_message(player, CompaniesConfig.PREFIX + u"&aКуплено &e{0}&a акций &b{1}&a за &e{2}&a. Налог: &6{3}&a. Цена: &f{4} &7→ &a{5}&a.".format(
             amount, company.get("name"), format_currency(subtotal), format_currency(applied_tax), format_share_price(old_price), format_share_price(new_price)
@@ -1137,10 +1073,8 @@ class CompanyService(object):
         if not company:
             send_message(player, CompaniesConfig.PREFIX + u"&cПредприятие не найдено.")
             return
-        if not self.is_tradable(player, company):
-            return
         amount = int(amount)
-        owned = self.available_owned_shares(company, uuid_str)
+        owned = self.owned_shares(company, uuid_str)
         if amount <= 0 or amount > owned:
             send_message(player, CompaniesConfig.PREFIX + u"&cУ вас акций этого предприятия: &e{0}&c.".format(owned))
             return
@@ -1158,20 +1092,11 @@ class CompanyService(object):
         tax = self.calculate_tax(company, subtotal, "resale")
         payout = round(subtotal - tax, 2)
         old_price = price
-        op_id = self.state.begin_operation("market_sell", {
-            "company": company.get("key"), "seller_uuid": uuid_str,
-            "seller_name": player_name, "shares": amount, "subtotal": subtotal,
-            "tax": tax, "payout": payout
-        })
-        if op_id is None:
-            send_message(player, CompaniesConfig.PREFIX + u"&cПродажа не начата: журнал операций недоступен.")
-            return
         snapshot = self.snapshot_company(company)
         company["balance"] = round(company_balance - subtotal, 2)
         company["available_shares"] = min(CompaniesConfig.SHARES_TOTAL, int(company.get("available_shares", 0)) + amount)
         self.add_shares(company, uuid_str, -amount)
         if not self.save_company_change(player, company, snapshot, "market sell"):
-            self.state.fail_operation(op_id, "company save failed")
             return
         deposited, balance = self.economy.deposit_checked(uuid_str, payout, player_name)
         if not deposited:
@@ -1179,10 +1104,8 @@ class CompanyService(object):
             if not self.state.save():
                 log_info(u"CRITICAL: failed to persist market sell rollback for {0}".format(company.get("name")))
             send_message(player, CompaniesConfig.PREFIX + u"&cПродажа отменена: деньги не удалось зачислить.")
-            self.state.fail_operation(op_id, "payout failed and company restored")
             return
         applied_tax = self.collect_town_tax(company, tax, uuid_str, player_name)
-        self.state.complete_operation(op_id, {"applied_tax": applied_tax, "new_price": self.current_price(company)})
         new_price = self.current_price(company)
         send_message(player, CompaniesConfig.PREFIX + u"&aПродано на бирже &e{0}&a акций &b{1}&a за &e{2}&a. Налог: &6{3}&a. Цена: &f{4} &7→ &c{5}&a.".format(
             amount, company.get("name"), format_currency(subtotal - applied_tax), format_currency(applied_tax), format_share_price(old_price), format_share_price(new_price)
@@ -1197,14 +1120,7 @@ class CompanyService(object):
             send_message(player, CompaniesConfig.PREFIX + u"&cФинансовые операции доступны только игроку.")
             return
         old_price = self.current_price(company)
-        op_id = self.state.begin_operation("owner_deposit", {
-            "company": company.get("key"), "owner_uuid": uuid_str, "amount": amount
-        })
-        if op_id is None:
-            send_message(player, CompaniesConfig.PREFIX + u"&cПополнение не начато: журнал операций недоступен.")
-            return
         if not self.economy.withdraw(uuid_str, amount):
-            self.state.fail_operation(op_id, "withdraw failed")
             send_message(player, CompaniesConfig.PREFIX + u"&cНе удалось списать деньги. Проверьте баланс и работу экономики.")
             return
         snapshot = self.snapshot_company(company)
@@ -1212,14 +1128,7 @@ class CompanyService(object):
         company["updated_at"] = int(time.time())
         if not self.save_company_change(player, company, snapshot, "owner deposit"):
             self.refund_player(uuid_str, amount, player_name, u"company deposit rollback")
-            self.state.fail_operation(op_id, "company save failed")
             return
-        if company.get("bankrupt") and float(company.get("balance", 0.0)) > 0:
-            company["bankrupt"] = False
-            company["bankrupt_at"] = 0
-            self.state.add_company_history(company, "bankruptcy_exit", player_name, amount)
-            self.state.save()
-        self.state.complete_operation(op_id, {"new_balance": company.get("balance")})
         broadcast_company(u"&7Компания &b{0}&7 пополнила счет на &e{1}&7. Акция: &f{2} &7→ &a{3}&7.".format(
             company.get("name"), format_currency(amount), format_share_price(old_price), format_share_price(self.current_price(company))
         ))
@@ -1235,298 +1144,11 @@ class CompanyService(object):
         if not uuid_str:
             send_message(player, CompaniesConfig.PREFIX + u"&cФинансовые операции доступны только игроку.")
             return
-        issued = sum([int(value) for value in company.get("shares", {}).values()])
-        threshold = float(company.get("balance", 0.0)) * CompaniesConfig.LARGE_WITHDRAW_PERCENT / 100.0
-        approval = company.get("approved_withdraw") or {}
-        approved = (
-            float(approval.get("amount", -1.0)) == round(float(amount), 2)
-            and int(approval.get("expires_at", 0)) >= int(time.time())
-        )
-        if approved:
-            company.pop("approved_withdraw", None)
-            if not self.state.save():
-                send_message(player, CompaniesConfig.PREFIX + u"&cНе удалось использовать одобрение акционеров.")
-                return
-        elif issued > 0 and amount >= threshold and not is_admin(player):
-            self.create_withdraw_vote(player, company, amount)
-            return
-        self.execute_withdraw(player, company, amount, uuid_str, player_name)
-
-    def create_withdraw_vote(self, player, company, amount):
-        now = int(time.time())
-        for vote in self.state.data.setdefault("withdraw_votes", {}).values():
-            if str(vote.get("company_key")) == str(company.get("key")) and int(vote.get("expires_at", 0)) >= now:
-                send_message(player, CompaniesConfig.PREFIX + u"&eПо этой компании уже идёт голосование №{0}.".format(vote.get("id")))
-                return
-        vote_id = str(self.state.data.get("next_vote_id", 1))
-        self.state.data["next_vote_id"] = int(vote_id) + 1
-        issued = sum([int(value) for value in company.get("shares", {}).values()])
-        vote = {
-            "id": vote_id, "company_key": company.get("key"),
-            "company_name": company.get("name"), "owner_uuid": company.get("owner_uuid"),
-            "owner_name": company.get("owner_name"), "amount": round(float(amount), 2),
-            "issued_shares": issued, "yes": {}, "no": {},
-            "expires_at": now + CompaniesConfig.WITHDRAW_VOTE_SECONDS
-        }
-        self.state.data["withdraw_votes"][vote_id] = vote
-        if not self.state.save():
-            self.state.data["withdraw_votes"].pop(vote_id, None)
-            send_message(player, CompaniesConfig.PREFIX + u"&cГолосование не удалось сохранить.")
-            return
-        broadcast_company(u"&eАкционеры &b{0}&e голосуют за вывод &6{1}&e. Команда: &f/shares vote {2} yes|no".format(
-            company.get("name"), format_currency(amount), vote_id))
-
-    def vote_withdraw(self, player, vote_id, decision):
-        vote = self.state.data.setdefault("withdraw_votes", {}).get(str(vote_id))
-        if not vote or int(vote.get("expires_at", 0)) < int(time.time()):
-            send_message(player, CompaniesConfig.PREFIX + u"&cГолосование не найдено или истекло.")
-            return
-        company = self.state.find_company(vote.get("company_key"))
-        if not company:
-            send_message(player, CompaniesConfig.PREFIX + u"&cПредприятие не найдено.")
-            return
-        uuid_str, player_name = get_sender_uuid_and_name(player)
-        weight = self.owned_shares(company, uuid_str)
-        if weight <= 0:
-            send_message(player, CompaniesConfig.PREFIX + u"&cГолосовать могут только акционеры.")
-            return
-        vote.setdefault("yes", {}).pop(str(uuid_str), None)
-        vote.setdefault("no", {}).pop(str(uuid_str), None)
-        vote["yes" if decision in ("yes", "да", "за") else "no"][str(uuid_str)] = weight
-        yes_weight = sum([int(v) for v in vote.get("yes", {}).values()])
-        no_weight = sum([int(v) for v in vote.get("no", {}).values()])
-        required = int(vote.get("issued_shares", 0)) / 2.0
-        if yes_weight > required:
-            company["approved_withdraw"] = {
-                "amount": float(vote.get("amount", 0.0)),
-                "expires_at": int(time.time()) + 600,
-                "vote_id": str(vote_id)
-            }
-            self.state.data["withdraw_votes"].pop(str(vote_id), None)
-            self.state.add_company_history(company, "withdraw_approved", player_name, vote.get("amount", 0.0), u"vote " + str(vote_id))
-            self.state.save()
-            self.notify(vote.get("owner_name"), u"&aАкционеры одобрили вывод &6{0}&a. Повторите команду вывода в течение 10 минут.".format(
-                format_currency(vote.get("amount", 0.0))))
-            return
-        if no_weight >= required:
-            self.state.data["withdraw_votes"].pop(str(vote_id), None)
-            self.state.save()
-            self.notify(vote.get("owner_name"), u"&cАкционеры отклонили крупный вывод средств.")
-            return
-        self.state.save()
-        send_message(player, CompaniesConfig.PREFIX + u"&aГолос учтён. За: &e{0}&a, против: &c{1}&a, всего акций: &f{2}&a.".format(
-            yes_weight, no_weight, vote.get("issued_shares", 0)))
-
-    def set_bankrupt(self, player, company_name):
-        company = self.require_owner(player, company_name)
-        if not company:
-            return
-        if company.get("bankrupt"):
-            send_message(player, CompaniesConfig.PREFIX + u"&7Предприятие уже находится в банкротстве.")
-            return
-        snapshot = self.snapshot_company(company)
-        company["bankrupt"] = True
-        company["bankrupt_at"] = int(time.time())
-        for offer_id, offer in list(self.state.data.setdefault("offers", {}).items()):
-            if str(offer.get("company_key")) == str(company.get("key")):
-                self.state.data["offers"].pop(offer_id, None)
-        self.state.add_company_history(company, "bankruptcy", get_sender_uuid_and_name(player)[1])
-        if not self.state.save():
-            self.restore_company(company, snapshot)
-            send_message(player, CompaniesConfig.PREFIX + u"&cБанкротство не удалось сохранить.")
-            return
-        broadcast_company(u"&cПредприятие &b{0}&c объявило банкротство. Торговля остановлена до пополнения счёта владельцем.".format(company.get("name")))
-
-    def show_history(self, sender, company_name):
-        company = self.state.find_company(company_name)
-        if not company:
-            send_message(sender, CompaniesConfig.PREFIX + u"&cПредприятие не найдено.")
-            return
-        send_message(sender, CompaniesConfig.PREFIX + u"&7Последние операции &b{0}&7:".format(company.get("name")))
-        for entry in company.get("transaction_history", [])[-10:]:
-            stamp = time.strftime("%d.%m %H:%M", time.localtime(int(entry.get("time", 0))))
-            send_message(sender, u"&8- &7{0} &f{1} &8| &e{2} &8| &6{3}".format(
-                stamp, entry.get("operation", "?"), entry.get("actor", "?"), format_currency(entry.get("amount", 0.0))))
-
-    def show_chart(self, sender, company_name):
-        company = self.state.find_company(company_name)
-        if not company:
-            send_message(sender, CompaniesConfig.PREFIX + u"&cПредприятие не найдено.")
-            return
-        send_message(sender, CompaniesConfig.PREFIX + u"&7Дневные котировки &b{0}&7:".format(company.get("name")))
-        for day in sorted(company.get("daily_ohlc", {}).keys())[-7:]:
-            c = company["daily_ohlc"][day]
-            send_message(sender, u"&8- &f{0} &7O:&a{1} &7H:&a{2} &7L:&c{3} &7C:&e{4}".format(
-                day, format_share_price(c.get("open")), format_share_price(c.get("high")),
-                format_share_price(c.get("low")), format_share_price(c.get("close"))))
-
-    def create_limit_order(self, player, side, company_name, amount, limit_price):
-        side = str(side).lower()
-        company = self.state.find_company(company_name)
-        if not company:
-            send_message(player, CompaniesConfig.PREFIX + u"&cПредприятие не найдено.")
-            return
-        if not self.is_tradable(player, company):
-            return
-        uuid_str, player_name = get_sender_uuid_and_name(player)
-        amount = int(amount)
-        limit_price = round(float(limit_price), 2)
-        if amount <= 0 or limit_price <= 0:
-            send_message(player, CompaniesConfig.PREFIX + u"&cКоличество и лимитная цена должны быть больше нуля.")
-            return
-        escrow = 0.0
-        if side == "buy":
-            max_subtotal = round(amount * limit_price, 2)
-            escrow = round(max_subtotal + self.calculate_tax(company, max_subtotal, "primary"), 2)
-            if not self.economy.withdraw(uuid_str, escrow):
-                send_message(player, CompaniesConfig.PREFIX + u"&cНедостаточно денег для резерва &e{0}&c.".format(format_currency(escrow)))
-                return
-        elif side == "sell":
-            if self.available_owned_shares(company, uuid_str) < amount:
-                send_message(player, CompaniesConfig.PREFIX + u"&cНедостаточно свободных акций; часть уже зарезервирована.")
-                return
-        else:
-            send_message(player, CompaniesConfig.PREFIX + u"&cСторона заявки: buy или sell.")
-            return
-        order_id = str(self.state.data.get("next_limit_order_id", 1))
-        self.state.data["next_limit_order_id"] = int(order_id) + 1
-        order = {
-            "id": order_id, "side": side, "company_key": company.get("key"),
-            "company_name": company.get("name"), "player_uuid": uuid_str,
-            "player_name": player_name, "amount": amount,
-            "limit_price": limit_price, "escrow": escrow,
-            "created_at": int(time.time()), "status": "open"
-        }
-        self.state.data.setdefault("limit_orders", {})[order_id] = order
-        if not self.state.save():
-            self.state.data["limit_orders"].pop(order_id, None)
-            if escrow > 0:
-                self.refund_player(uuid_str, escrow, player_name, u"limit order save rollback")
-            send_message(player, CompaniesConfig.PREFIX + u"&cЛимитная заявка не сохранена.")
-            return
-        send_message(player, CompaniesConfig.PREFIX + u"&aЗаявка №{0}: &e{1} {2} &aакций &b{3}&a по цене &6{4}&a.".format(
-            order_id, side.upper(), amount, company.get("name"), format_share_price(limit_price)))
-
-    def cancel_limit_order(self, player, order_id):
-        order = self.state.data.setdefault("limit_orders", {}).get(str(order_id))
-        uuid_str, player_name = get_sender_uuid_and_name(player)
-        if not order or (str(order.get("player_uuid")) != str(uuid_str) and not is_admin(player)):
-            send_message(player, CompaniesConfig.PREFIX + u"&cЗаявка не найдена.")
-            return
-        if str(order.get("status", "open")) in ("refund_in_progress", "payout_in_progress"):
-            send_message(player, CompaniesConfig.PREFIX + u"&cРасчёт заявки имеет неопределённый результат. Администратор должен сверить журнал и выполнить /shares resolve.")
-            return
-        escrow = float(order.get("escrow", 0.0)) + float(order.get("refund_due", 0.0))
-        if escrow > 0:
-            order["status"] = "refund_in_progress"
-            if not self.state.save():
-                order["status"] = "open"
-                send_message(player, CompaniesConfig.PREFIX + u"&cНе удалось зафиксировать начало возврата.")
-                return
-            ok, balance = self.economy.deposit_checked(order.get("player_uuid"), escrow, order.get("player_name"))
-            if not ok:
-                order["status"] = "filled_refund_due" if float(order.get("refund_due", 0.0)) > 0 else "open"
-                self.state.save()
-                send_message(player, CompaniesConfig.PREFIX + u"&cНе удалось вернуть резерв; заявка оставлена открытой.")
-                return
-            order["escrow"] = 0.0
-            order["refund_due"] = 0.0
-            order["status"] = "refund_paid"
-            if not self.state.save():
-                send_message(player, CompaniesConfig.PREFIX + u"&cВозврат выполнен, но закрытие заявки требует проверки администратором.")
-                return
-        self.state.data["limit_orders"].pop(str(order_id), None)
-        if not self.state.save():
-            order["status"] = "closed"
-            self.state.data["limit_orders"][str(order_id)] = order
-        send_message(player, CompaniesConfig.PREFIX + u"&aЗаявка отменена, резерв возвращён.")
-
-    def resolve_limit_order(self, sender, order_id, action):
-        if not is_admin(sender):
-            send_message(sender, CompaniesConfig.PREFIX + u"&cТребуются права администратора.")
-            return
-        order = self.state.data.setdefault("limit_orders", {}).get(str(order_id))
-        action = str(action).lower()
-        if not order or action not in ("paid", "retry", "rollback", "reset"):
-            send_message(sender, CompaniesConfig.PREFIX + u"&cИспользование: /shares resolve <id> <paid|retry|rollback|reset>")
-            return
-        status = str(order.get("status", "open"))
-        company = self.state.find_company(order.get("company_key"))
-        order_snapshot = copy.deepcopy(order)
-        company_snapshot = self.snapshot_company(company) if company else None
-        if action == "reset":
-            if status not in ("processing_buy", "processing_sell"):
-                send_message(sender, CompaniesConfig.PREFIX + u"&cСброс допустим только для операции, оборванной до расчёта.")
-                return
-            order["status"] = "open"
-            if not self.state.save():
-                order.clear()
-                order.update(order_snapshot)
-                send_message(sender, CompaniesConfig.PREFIX + u"&cСброс не удалось сохранить.")
-                return
-            send_message(sender, CompaniesConfig.PREFIX + u"&aЗаявка возвращена в очередь исполнения.")
-            return
-        if action == "paid" and status not in ("refund_in_progress", "payout_in_progress", "refund_paid", "payout_paid", "closed"):
-            send_message(sender, CompaniesConfig.PREFIX + u"&cСтатус заявки нельзя закрыть как оплаченный.")
-            return
-        if action == "retry" and status == "refund_in_progress":
-            amount = float(order.get("refund_due", 0.0)) + float(order.get("escrow", 0.0))
-            ok, balance = self.economy.deposit_checked(order.get("player_uuid"), amount, order.get("player_name"))
-            if not ok:
-                send_message(sender, CompaniesConfig.PREFIX + u"&cПовторный возврат не подтверждён.")
-                return
-        elif action == "rollback" and status == "payout_in_progress" and company:
-            amount = int(order.get("filled_amount", 0))
-            subtotal = float(order.get("filled_subtotal", 0.0))
-            if amount <= 0 or subtotal <= 0:
-                send_message(sender, CompaniesConfig.PREFIX + u"&cВ записи недостаточно данных для отката.")
-                return
-            if int(company.get("available_shares", 0)) < amount:
-                send_message(sender, CompaniesConfig.PREFIX + u"&cОткат невозможен: свободные акции уже изменились. Нужна ручная сверка.")
-                return
-            company["balance"] = round(float(company.get("balance", 0.0)) + subtotal, 2)
-            company["available_shares"] = max(0, int(company.get("available_shares", 0)) - amount)
-            self.add_shares(company, order.get("player_uuid"), amount)
-        elif action == "retry" and status not in ("refund_in_progress",):
-            send_message(sender, CompaniesConfig.PREFIX + u"&cПовтор допустим только для неопределённого возврата.")
-            return
-        elif action == "rollback" and status != "payout_in_progress":
-            send_message(sender, CompaniesConfig.PREFIX + u"&cОткат допустим только для неопределённой выплаты продажи.")
-            return
-        self.state.data["limit_orders"].pop(str(order_id), None)
-        if not self.state.save():
-            if company is not None and company_snapshot is not None:
-                self.restore_company(company, company_snapshot)
-            self.state.data["limit_orders"][str(order_id)] = order_snapshot
-            send_message(sender, CompaniesConfig.PREFIX + u"&cРешение не сохранено; проверьте журнал до повторной операции.")
-            return
-        send_message(sender, CompaniesConfig.PREFIX + u"&aЗаявка №{0} закрыта решением {1}.".format(order_id, action))
-
-    def list_limit_orders(self, sender):
-        uuid_str, player_name = get_sender_uuid_and_name(sender)
-        orders = [item for item in self.state.data.setdefault("limit_orders", {}).values()
-                  if str(item.get("player_uuid")) == str(uuid_str) or is_admin(sender)]
-        if not orders:
-            send_message(sender, CompaniesConfig.PREFIX + u"&7Лимитных заявок нет.")
-            return
-        for order in orders[:30]:
-            send_message(sender, u"&8- &e#{0} &f{1} &b{2} &7x{3} @ &6{4} &8({5})".format(
-                order.get("id"), str(order.get("side", "?")).upper(), order.get("company_name"),
-                order.get("amount", 0), format_share_price(order.get("limit_price", 0)), order.get("status", "open")))
-
-    def execute_withdraw(self, player, company, amount, uuid_str, player_name):
         old_price = self.current_price(company)
-        op_id = self.state.begin_operation("owner_withdraw", {
-            "company": company.get("key"), "owner_uuid": uuid_str, "amount": amount
-        })
-        if op_id is None:
-            send_message(player, CompaniesConfig.PREFIX + u"&cВывод не начат: журнал операций недоступен.")
-            return
         snapshot = self.snapshot_company(company)
         company["balance"] = round(float(company.get("balance", 0.0)) - float(amount), 2)
         company["updated_at"] = int(time.time())
         if not self.save_company_change(player, company, snapshot, "owner withdraw"):
-            self.state.fail_operation(op_id, "company save failed")
             return
         deposited, balance = self.economy.deposit_checked(uuid_str, amount, player_name)
         if not deposited:
@@ -1534,9 +1156,7 @@ class CompanyService(object):
             if not self.state.save():
                 log_info(u"CRITICAL: failed to persist company withdrawal rollback for {0}".format(company.get("name")))
             send_message(player, CompaniesConfig.PREFIX + u"&cВывод отменен: деньги не удалось зачислить.")
-            self.state.fail_operation(op_id, "payout failed and company restored")
             return
-        self.state.complete_operation(op_id, {"new_balance": company.get("balance")})
         send_message(player, CompaniesConfig.PREFIX + u"&aВы вывели &e{0}&a со счета &b{1}&a. Цена: &f{2} &7→ &c{3}&a.".format(
             format_currency(amount), company.get("name"), format_share_price(old_price), format_share_price(self.current_price(company))
         ))
@@ -1548,6 +1168,7 @@ class CompanyService(object):
         snapshot = self.snapshot_company(company)
         if to_unicode(raw_value).lower() in ("off", "0", "disable"):
             company["dividends"] = 0.0
+            company["next_dividend_at"] = 0
             company["updated_at"] = int(time.time())
             if not self.save_company_change(player, company, snapshot, "disable dividends"):
                 return
@@ -1555,10 +1176,12 @@ class CompanyService(object):
             return
         amount = parse_amount(raw_value)
         company["dividends"] = amount
+        company["next_dividend_at"] = int(time.time()) + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS
+        company["dividend_schedule_version"] = CompaniesConfig.DIVIDEND_SCHEDULE_VERSION
         company["updated_at"] = int(time.time())
         if not self.save_company_change(player, company, snapshot, "set dividends"):
             return
-        send_message(player, CompaniesConfig.PREFIX + u"&aДивиденды &b{0}&a: &e{1}&a раз в 24 часа.".format(company.get("name"), format_currency(amount)))
+        send_message(player, CompaniesConfig.PREFIX + u"&aДивиденды &b{0}&a: &e{1}&a каждые 5 минут (тестовый режим).".format(company.get("name"), format_currency(amount)))
 
     def rename(self, player, company_name, new_name):
         company = self.require_owner(player, company_name)
@@ -1614,9 +1237,7 @@ class CompanyService(object):
         if str(target.uuid) == str(company.get("owner_uuid")):
             send_message(sender, CompaniesConfig.PREFIX + u"&cВладелец не может получать акции своей компании.")
             return
-        if not self.is_tradable(sender, company):
-            return
-        if self.available_owned_shares(company, sender_uuid) < amount:
+        if self.owned_shares(company, sender_uuid) < amount:
             send_message(sender, CompaniesConfig.PREFIX + u"&cНедостаточно акций.")
             return
         snapshot = self.snapshot_company(company)
@@ -1643,9 +1264,7 @@ class CompanyService(object):
         if str(target.uuid) == str(company.get("owner_uuid")):
             send_message(sender, CompaniesConfig.PREFIX + u"&cВладелец не может покупать акции своей компании.")
             return
-        if not self.is_tradable(sender, company):
-            return
-        if self.available_owned_shares(company, sender_uuid) < amount:
+        if self.owned_shares(company, sender_uuid) < amount:
             send_message(sender, CompaniesConfig.PREFIX + u"&cНедостаточно акций.")
             return
         old_next_offer_id = self.state.data.get("next_offer_id", 1)
@@ -1687,8 +1306,6 @@ class CompanyService(object):
             self.remove_offer_checked(offer_id)
             send_message(player, CompaniesConfig.PREFIX + u"&cПредприятие больше не существует.")
             return
-        if not self.is_tradable(player, company):
-            return
         if str(uuid_str) == str(company.get("owner_uuid")):
             removed, old_offer = self.remove_offer_checked(offer_id)
             if removed:
@@ -1710,25 +1327,16 @@ class CompanyService(object):
             return
         tax = self.calculate_tax(company, price, "resale")
         total = round(price + tax, 2)
-        if self.available_owned_shares(company, offer.get("seller_uuid"), offer_id) < amount:
+        if self.owned_shares(company, offer.get("seller_uuid")) < amount:
             send_message(player, CompaniesConfig.PREFIX + u"&cУ продавца уже нет этих акций.")
             return
         if not self.economy.has_enough(uuid_str, total):
             send_message(player, CompaniesConfig.PREFIX + u"&cНужно &e{0}&c с учетом налога.".format(format_currency(total)))
             return
-        op_id = self.state.begin_operation("private_offer", {
-            "offer_id": str(offer_id), "company": company.get("key"),
-            "buyer_uuid": uuid_str, "seller_uuid": offer.get("seller_uuid"),
-            "shares": amount, "price": price, "tax": tax
-        })
-        if op_id is None:
-            send_message(player, CompaniesConfig.PREFIX + u"&cСделка не начата: журнал операций недоступен.")
-            return
         transferred, buyer_balance, seller_balance = self.economy.transfer(
             uuid_str, offer.get("seller_uuid"), price, offer.get("seller_name")
         )
         if not transferred:
-            self.state.fail_operation(op_id, "buyer to seller transfer failed")
             send_message(player, CompaniesConfig.PREFIX + u"&cСделка отменена: перевод продавцу не выполнен.")
             return
         if tax > 0 and not self.economy.withdraw(uuid_str, tax):
@@ -1737,7 +1345,6 @@ class CompanyService(object):
             )
             if not reversed_ok:
                 log_info(u"CRITICAL: failed to reverse offer transfer {0}".format(offer_id))
-            self.state.fail_operation(op_id, "tax withdraw failed")
             send_message(player, CompaniesConfig.PREFIX + u"&cСделка отменена: налог не удалось списать.")
             return
         snapshot = self.snapshot_company(company)
@@ -1754,12 +1361,9 @@ class CompanyService(object):
                 self.refund_player(uuid_str, tax, player_name, u"offer persistence rollback")
             if not reversed_ok:
                 log_info(u"CRITICAL: failed to reverse offer {0} after company save failure".format(offer_id))
-            self.state.fail_operation(op_id, "share state save failed")
             send_message(player, CompaniesConfig.PREFIX + u"&cСделка отменена: данные акций не удалось сохранить.")
             return
         applied_tax = self.collect_town_tax(company, tax, uuid_str, player_name)
-        self.state.add_company_history(company, "private_offer", player_name, price, u"shares={0}".format(amount))
-        self.state.complete_operation(op_id, {"applied_tax": applied_tax})
         send_message(player, CompaniesConfig.PREFIX + u"&aВы купили &e{0}&a акций &b{1}&a за &e{2}&a. Налог: &6{3}&a.".format(amount, company.get("name"), format_currency(price), format_currency(applied_tax)))
         self.notify(offer.get("seller_name"), u"&aВаши акции &b{0}&a купил &e{1}&a за &e{2}&a.".format(company.get("name"), player_name, format_currency(price)))
 
@@ -1776,193 +1380,102 @@ class CompanyService(object):
         else:
             send_message(player, CompaniesConfig.PREFIX + u"&cПредложение не найдено.")
 
-    def process_limit_orders(self):
-        for order_id, order in list(self.state.data.setdefault("limit_orders", {}).items()):
-            company = self.state.find_company(order.get("company_key"))
-            if (not company or company.get("bankrupt") or int(order.get("amount", 0)) <= 0 or
-                    str(order.get("status", "open")) != "open"):
-                continue
-            amount = int(order.get("amount", 0))
-            limit_price = float(order.get("limit_price", 0.0))
-            price = self.current_price(company)
-            if order.get("side") == "buy":
-                if price > limit_price or amount > int(company.get("available_shares", 0)):
-                    continue
-                subtotal = self.marginal_buy_cost(company, amount)
-                tax = self.calculate_tax(company, subtotal, "primary")
-                total = round(subtotal + tax, 2)
-                escrow = float(order.get("escrow", 0.0))
-                if subtotal > round(amount * limit_price, 2) or total > escrow:
-                    continue
-                order["status"] = "processing_buy"
-                if not self.state.save():
-                    order["status"] = "open"
-                    continue
-                snapshot = self.snapshot_company(company)
-                company["balance"] = round(float(company.get("balance", 0.0)) + subtotal, 2)
-                company["available_shares"] = int(company.get("available_shares", 0)) - amount
-                self.add_shares(company, order.get("player_uuid"), amount)
-                self.state.add_company_history(company, "limit_buy", order.get("player_name"), total, u"shares={0}".format(amount))
-                order["amount"] = 0
-                order["filled_amount"] = amount
-                order["escrow"] = 0.0
-                order["refund_due"] = round(escrow - total, 2)
-                order["status"] = "filled_tax_pending"
-                if not self.state.save():
-                    self.restore_company(company, snapshot)
-                    order["amount"] = amount
-                    order["filled_amount"] = 0
-                    order["escrow"] = escrow
-                    order["refund_due"] = 0.0
-                    order["status"] = "open"
-                    self.state.save()
-                    continue
-                applied_tax = self.collect_town_tax(company, tax)
-                refund = round(escrow - subtotal - applied_tax, 2)
-                order["refund_due"] = refund
-                if refund > 0:
-                    order["status"] = "refund_in_progress"
-                    if not self.state.save():
-                        continue
-                    ok, balance = self.economy.deposit_checked(order.get("player_uuid"), refund, order.get("player_name"))
-                    if not ok:
-                        order["status"] = "filled_refund_due"
-                        self.state.save()
-                        continue
-                    order["refund_due"] = 0.0
-                    order["status"] = "refund_paid"
-                    if not self.state.save():
-                        continue
-                self.state.data["limit_orders"].pop(order_id, None)
-                self.state.save()
-                self.notify(order.get("player_name"), u"&aИсполнена лимитная покупка №{0}: &e{1}&a акций &b{2}&a.".format(
-                    order_id, amount, company.get("name")))
-            elif order.get("side") == "sell":
-                if price < limit_price or self.owned_shares(company, order.get("player_uuid")) < amount:
-                    continue
-                subtotal = self.marginal_sell_value(company, amount)
-                if subtotal > float(company.get("balance", 0.0)):
-                    continue
-                tax = self.calculate_tax(company, subtotal, "resale")
-                payout = round(subtotal - tax, 2)
-                order["status"] = "processing_sell"
-                if not self.state.save():
-                    order["status"] = "open"
-                    continue
-                snapshot = self.snapshot_company(company)
-                company["balance"] = round(float(company.get("balance", 0.0)) - subtotal, 2)
-                company["available_shares"] = min(CompaniesConfig.SHARES_TOTAL, int(company.get("available_shares", 0)) + amount)
-                self.add_shares(company, order.get("player_uuid"), -amount)
-                self.state.add_company_history(company, "limit_sell", order.get("player_name"), payout, u"shares={0}".format(amount))
-                order["amount"] = 0
-                order["filled_amount"] = amount
-                order["filled_subtotal"] = subtotal
-                order["payout"] = payout
-                order["tax"] = tax
-                order["status"] = "payout_in_progress"
-                if not self.state.save():
-                    self.restore_company(company, snapshot)
-                    order["amount"] = amount
-                    order["filled_amount"] = 0
-                    order["status"] = "open"
-                    self.state.save()
-                    continue
-                ok, balance = self.economy.deposit_checked(order.get("player_uuid"), payout, order.get("player_name"))
-                if not ok:
-                    self.restore_company(company, snapshot)
-                    order["amount"] = amount
-                    order["filled_amount"] = 0
-                    order["status"] = "open"
-                    self.state.save()
-                    continue
-                self.collect_town_tax(company, tax, order.get("player_uuid"), order.get("player_name"))
-                order["status"] = "payout_paid"
-                if not self.state.save():
-                    continue
-                self.state.data["limit_orders"].pop(order_id, None)
-                self.state.save()
-                self.notify(order.get("player_name"), u"&aИсполнена лимитная продажа №{0}: &e{1}&a акций &b{2}&a.".format(
-                    order_id, amount, company.get("name")))
-
     def process_dividends(self):
-        now = int(time.time())
-        self.process_limit_orders()
-        # Истёкшие офферы освобождают зарезервированные акции.
-        expired_offers = [oid for oid, offer in self.state.data.setdefault("offers", {}).items()
-                          if int(offer.get("expires_at", 0)) < now]
-        for offer_id in expired_offers:
-            self.state.data["offers"].pop(offer_id, None)
-        expired_votes = [vid for vid, vote in self.state.data.setdefault("withdraw_votes", {}).items()
-                         if int(vote.get("expires_at", 0)) < now]
-        for vote_id in expired_votes:
-            self.state.data["withdraw_votes"].pop(vote_id, None)
-        if expired_offers or expired_votes:
-            self.state.save()
-        for company in self.state.list_companies():
-            dividends = safe_float(company.get("dividends", 0.0), 0.0, 0.0)
-            if company.get("bankrupt") or dividends <= 0 or int(company.get("next_dividend_at", 0)) > now:
-                continue
-            op_id = self.state.begin_operation("dividends", {
-                "company": company.get("key"), "pool": dividends,
-                "shareholders": copy.deepcopy(company.get("shares", {}))
-            })
-            if op_id is None:
-                continue
-            snapshot = self.snapshot_company(company)
-            company["next_dividend_at"] = now + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS
-            if float(company.get("balance", 0.0)) < dividends:
+        self.dividend_lock.acquire()
+        if self.dividend_processing:
+            self.dividend_lock.release()
+            return
+        self.dividend_processing = True
+        self.dividend_lock.release()
+        try:
+            now = int(time.time())
+            for company in self.state.list_companies():
+                pending = company.get("pending_dividend")
+                if pending:
+                    self._complete_pending_dividend(company, pending)
+                    if company.get("pending_dividend"):
+                        continue
+
+                dividends = safe_float(company.get("dividends", 0.0), 0.0, 0.0)
+                next_due = int(company.get("next_dividend_at", 0) or 0)
+                if dividends <= 0 or next_due <= 0 or next_due > now:
+                    continue
+
+                snapshot = self.snapshot_company(company)
+                company["next_dividend_at"] = next_due + CompaniesConfig.DIVIDEND_INTERVAL_SECONDS
+                if safe_float(company.get("balance", 0.0), 0.0, 0.0) < dividends:
+                    if not self.state.save():
+                        self.restore_company(company, snapshot)
+                    log_info(u"Dividend skipped for {0}: insufficient company balance".format(company.get("name")))
+                    continue
+
+                payouts = allocate_dividend_payouts(dividends, company.get("shares", {}))
+                if not payouts:
+                    if not self.state.save():
+                        self.restore_company(company, snapshot)
+                    log_info(u"Dividend skipped for {0}: no issued shares".format(company.get("name")))
+                    continue
+
+                operation_id = "company-dividend:{0}:{1}".format(company.get("id"), next_due)
+                pending = {
+                    "operation_id": operation_id,
+                    "amount": round(dividends, 2),
+                    "due_at": next_due,
+                    "created_at": now,
+                    "payouts": payouts
+                }
+                company["balance"] = round(float(company.get("balance", 0.0)) - dividends, 2)
+                company["pending_dividend"] = pending
+                company["updated_at"] = now
                 if not self.state.save():
                     self.restore_company(company, snapshot)
-                self.state.fail_operation(op_id, "insufficient company balance")
-                continue
-            total_owned = sum([int(v) for v in company.get("shares", {}).values()])
-            if total_owned <= 0:
-                if not self.state.save():
-                    self.restore_company(company, snapshot)
-                self.state.fail_operation(op_id, "no shareholders")
-                continue
-            tax = self.calculate_tax(company, dividends, "dividends")
-            pool = round(dividends - tax, 2)
-            company["balance"] = round(float(company.get("balance", 0.0)) - dividends, 2)
-            company["updated_at"] = now
-            if not self.state.save():
-                self.restore_company(company, snapshot)
-                log_info(u"Dividend skipped for {0}: company state could not be saved".format(company.get("name")))
-                self.state.fail_operation(op_id, "company save failed")
-                continue
-            payouts = []
-            for uuid_str, shares in company.get("shares", {}).items():
-                payout = round(pool * float(shares) / float(total_owned), 2)
-                if payout > 0:
-                    payouts.append([uuid_str, payout])
-            if payouts:
-                rounding_delta = round(pool - sum([item[1] for item in payouts]), 2)
-                payouts[0][1] = round(payouts[0][1] + rounding_delta, 2)
-            unpaid = round(pool - sum([item[1] for item in payouts]), 2)
-            paid = 0.0
-            for uuid_str, payout in payouts:
-                # The UUID identifies the shareholder. "Investor" used to be
-                # passed as a fake player name here and permanently polluted
-                # economy.json / baltop. Never send a role label as identity.
-                deposited, balance = self.economy.deposit_checked(uuid_str, payout, None)
-                if deposited:
-                    paid = round(paid + payout, 2)
-                else:
-                    unpaid = round(unpaid + payout, 2)
-                    log_info(u"Dividend credit failed for {0} in {1}".format(uuid_str, company.get("name")))
-            applied_tax = self.collect_town_tax(company, tax)
-            unpaid = round(unpaid + (tax - applied_tax), 2)
-            if unpaid > 0:
-                company["balance"] = round(float(company.get("balance", 0.0)) + unpaid, 2)
-                if not self.state.save():
-                    log_info(u"CRITICAL: failed to return unpaid dividends to {0}, amount={1}".format(company.get("name"), unpaid))
-            self.state.add_company_history(
-                company, "dividends", u"System", paid,
-                u"Налог городу: {0}; невыплачено: {1}".format(applied_tax, unpaid))
-            self.state.complete_operation(op_id, {
-                "paid": paid, "town_tax": applied_tax, "unpaid_returned": unpaid
-            })
-            broadcast_company(u"&7Компания &b{0}&7 выплатила дивиденды &e{1}&7. Налог города: &6{2}&7.".format(company.get("name"), format_currency(paid), format_currency(applied_tax)))
+                    log_info(u"Dividend skipped for {0}: payment reservation could not be saved".format(company.get("name")))
+                    continue
+                self._complete_pending_dividend(company, pending)
+        finally:
+            self.dividend_lock.acquire()
+            self.dividend_processing = False
+            self.dividend_lock.release()
+
+    def _complete_pending_dividend(self, company, pending):
+        payouts = pending.get("payouts", []) if isinstance(pending, dict) else []
+        operation_id = pending.get("operation_id") if isinstance(pending, dict) else None
+        expected_cents = int(round(safe_float(pending.get("amount"), 0.0, 0.0) * 100.0)) if isinstance(pending, dict) else 0
+        try:
+            payout_cents = sum([int(round(safe_float(item[1], 0.0, 0.0) * 100.0)) for item in payouts])
+        except Exception:
+            payout_cents = -1
+        if not operation_id or expected_cents <= 0 or payout_cents != expected_cents:
+            self.log_dividend_error(
+                operation_id,
+                u"Dividend {0} remains pending: invalid payout invariant".format(operation_id)
+            )
+            return False
+        success, already_processed = self.economy.deposit_batch_once(operation_id, payouts)
+        if not success:
+            self.log_dividend_error(
+                operation_id,
+                u"Dividend {0} remains pending: economy batch deposit is unavailable".format(operation_id)
+            )
+            return False
+
+        snapshot = self.snapshot_company(company)
+        company["pending_dividend"] = None
+        company["last_dividend_at"] = int(time.time())
+        company["last_dividend_amount"] = round(safe_float(pending.get("amount"), 0.0, 0.0), 2)
+        company["updated_at"] = int(time.time())
+        if not self.state.save():
+            self.restore_company(company, snapshot)
+            self.log_dividend_error(
+                operation_id,
+                u"Dividend {0} was credited but remains pending until company state can be saved".format(operation_id)
+            )
+            return False
+        self.dividend_error_log_at.pop(str(operation_id), None)
+        broadcast_company(u"&7Компания &b{0}&7 выплатила акционерам дивиденды &e{1}&7.".format(
+            company.get("name"), format_currency(pending.get("amount", 0.0))
+        ))
+        return True
 
     def calculate_tax(self, company, amount, operation):
         percent = self.towns.get_tax_percent(company.get("town"), operation)
@@ -2501,14 +2014,6 @@ class CompaniesCommand(object):
                     service.delete(sender, args[1])
                 else:
                     send_message(sender, CompaniesConfig.PREFIX + u"&cЗакрытие удалит счет и все акции. Подтвердите: &e/company delete {0} confirm".format(args[1]))
-            elif sub == "bankrupt" and len(args) >= 3 and args[2].lower() == "confirm":
-                service.set_bankrupt(sender, args[1])
-            elif sub == "history" and len(args) >= 2:
-                service.show_history(sender, args[1])
-            elif sub == "chart" and len(args) >= 2:
-                service.show_chart(sender, args[1])
-            elif sub == "journal" and is_admin(sender):
-                self.send_journal(sender)
             else:
                 self.send_help(sender)
         except ValueError:
@@ -2534,16 +2039,6 @@ class CompaniesCommand(object):
                 service.accept_offer(sender, args[1])
             elif sub == "deny" and len(args) >= 2:
                 service.deny_offer(sender, args[1])
-            elif sub == "vote" and len(args) >= 3:
-                service.vote_withdraw(sender, args[1], args[2].lower())
-            elif sub == "limit" and len(args) >= 5:
-                service.create_limit_order(sender, args[1], args[2], parse_int(args[3]), parse_amount(args[4]))
-            elif sub == "orders":
-                service.list_limit_orders(sender)
-            elif sub == "cancel" and len(args) >= 2:
-                service.cancel_limit_order(sender, args[1])
-            elif sub == "resolve" and len(args) >= 3:
-                service.resolve_limit_order(sender, args[1], args[2])
             else:
                 self.send_shares_help(sender)
         except ValueError:
@@ -2557,8 +2052,6 @@ class CompaniesCommand(object):
         send_message(sender, u"&e/company deposit/withdraw <компания> <сумма> &7- счет владельца")
         send_message(sender, u"&e/company dividends <компания> <сумма|off> &7- дивиденды")
         send_message(sender, u"&e/company rename/description/delete <компания> ... &7- управление")
-        send_message(sender, u"&e/company history/chart <компания> &7- аудит и дневные OHLC")
-        send_message(sender, u"&e/company bankrupt <компания> confirm &7- заморозить предприятие")
         send_message(sender, u"&e/companies &7- каталог предприятий")
         send_message(sender, u"&e/shares &7- ваши акции")
 
@@ -2568,20 +2061,6 @@ class CompaniesCommand(object):
         send_message(sender, u"&e/shares give <компания> <игрок> <акции>")
         send_message(sender, u"&e/shares sell <компания> <игрок> <акции> <цена>")
         send_message(sender, u"&e/shares accept/deny <id>")
-        send_message(sender, u"&e/shares vote <id> <yes|no> &7- голосование акционеров")
-        send_message(sender, u"&e/shares limit <buy|sell> <компания> <акции> <цена>")
-        send_message(sender, u"&e/shares orders | cancel <id> &7- ваши лимитные заявки")
-        if is_admin(sender):
-            send_message(sender, u"&e/shares resolve <id> <paid|retry|rollback|reset> &7- сверка оборванной операции")
-
-    def send_journal(self, sender):
-        pending = state.data.get("operation_journal", {})
-        if not pending:
-            send_message(sender, CompaniesConfig.PREFIX + u"&7Незавершённых операций нет.")
-            return
-        for op_id, entry in list(pending.items())[:20]:
-            send_message(sender, u"&8- &e#{0} &f{1} &8| &7{2}".format(
-                op_id, entry.get("operation", "?"), entry.get("payload", {})))
 
     def send_list(self, sender):
         companies = state.list_companies()
@@ -2633,12 +2112,12 @@ class CompaniesCommand(object):
 
     def tab_company(self, sender, alias, args):
         args = list(args)
-        subs = ["help", "create", "open", "info", "buy", "deposit", "withdraw", "dividends", "rename", "description", "delete", "bankrupt", "history", "chart", "journal"]
+        subs = ["help", "create", "open", "info", "buy", "deposit", "withdraw", "dividends", "rename", "description", "delete"]
         if len(args) <= 1:
             prefix = args[0].lower() if args else ""
             return build_java_list([sub for sub in subs if sub.startswith(prefix)])
         sub = args[0].lower()
-        if len(args) == 2 and sub in ("open", "info", "buy", "deposit", "withdraw", "dividends", "rename", "description", "delete", "bankrupt", "history", "chart"):
+        if len(args) == 2 and sub in ("open", "info", "buy", "deposit", "withdraw", "dividends", "rename", "description", "delete"):
             return self.tab_companies(args[1])
         if len(args) == 3 and sub in ("buy", "deposit", "withdraw"):
             return build_java_list(["1", "10", "100", "1000", "10000"])
@@ -2650,9 +2129,7 @@ class CompaniesCommand(object):
 
     def tab_shares(self, sender, alias, args):
         args = list(args)
-        subs = ["list", "market", "give", "sell", "accept", "deny", "vote", "limit", "orders", "cancel"]
-        if is_admin(sender):
-            subs.append("resolve")
+        subs = ["list", "market", "give", "sell", "accept", "deny"]
         if len(args) <= 1:
             prefix = args[0].lower() if args else ""
             return build_java_list([sub for sub in subs if sub.startswith(prefix)])
@@ -2667,18 +2144,6 @@ class CompaniesCommand(object):
             return build_java_list(["1", "10", "100", "1000"])
         if len(args) == 5 and sub == "sell":
             return build_java_list(["1000", "10000", "50000", "100000"])
-        if len(args) == 3 and sub == "vote":
-            return build_java_list(["yes", "no"])
-        if len(args) == 2 and sub == "limit":
-            return build_java_list(["buy", "sell"])
-        if len(args) == 3 and sub == "limit":
-            return self.tab_companies(args[2])
-        if len(args) == 4 and sub == "limit":
-            return build_java_list(["1", "10", "100", "1000"])
-        if len(args) == 5 and sub == "limit":
-            return build_java_list(["10", "100", "1000", "10000"])
-        if len(args) == 3 and sub == "resolve":
-            return build_java_list(["paid", "retry", "rollback", "reset"])
         return build_java_list([])
 
     def tab_companies(self, prefix):
@@ -2784,6 +2249,11 @@ def on_inventory_click(event):
         if raw_slot < 0 or raw_slot >= top_inv.getSize():
             return
         player = event.getWhoClicked()
+        if hasattr(player, "setItemOnCursor") and ItemStack is not None and Material is not None:
+            try:
+                player.setItemOnCursor(ItemStack(Material.AIR, 1))
+            except Exception:
+                pass
         holder.gui.handle_click(player, raw_slot, str(event.getClick()) if hasattr(event, "getClick") else "LEFT")
     except Exception as exc:
         log_info(u"Inventory click error: {0}".format(exc))
@@ -2949,9 +2419,9 @@ def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases):
 
 
 registered_company_commands = []   # (name, aliases) - для полного снятия при выгрузке,
-                                    # т.к. эти команды внедрены напрямую в CommandMap в
-                                    # обход command_manager PySpigot и PySpigot не может
-                                    # их снять сам при /pyspigot unload.
+# т.к. эти команды внедрены напрямую в CommandMap в
+# обход command_manager PySpigot и PySpigot не может
+# их снять сам при /pyspigot unload.
 
 
 def force_unregister_bukkit_command(fallback_prefix, name, aliases):
@@ -3024,7 +2494,12 @@ def start_dividend_timer():
         return
     plugin = get_pyspigot_plugin()
     if plugin:
-        task = Bukkit.getScheduler().runTaskTimer(plugin, DividendRunnable(), 1200, CompaniesConfig.DIVIDEND_TASK_PERIOD_TICKS)
+        task = Bukkit.getScheduler().runTaskTimer(
+            plugin,
+            DividendRunnable(),
+            CompaniesConfig.DIVIDEND_TASK_INITIAL_DELAY_TICKS,
+            CompaniesConfig.DIVIDEND_TASK_PERIOD_TICKS
+        )
         dividend_task_id = task.getTaskId()
         store_dividend_task_id(dividend_task_id)
 

@@ -2245,4 +2245,3 @@ listener_mgr.registerListener(_uz_on_explode, EntityExplodeEvent)
 scheduler.runTaskLater(_uz_tick, 2)
 Bukkit.getLogger().info("[geto] Uzumaki extraction module loaded.")
 # GETO_UZUMAKI_EXTRACTION_V1
-

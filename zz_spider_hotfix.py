@@ -8,7 +8,8 @@ Loads after agent_spider.py and patches its live globals without touching main/t
 - embeds that signed textures property directly into the Paper player-head profile;
 - falls back to Paper/Mojang profile resolution only if SkinsRestorer data is unavailable;
 - restores Web Ball and Web Grenade as ejector modes 13 and 14;
-- keeps the current quest modes 0..12 unchanged.
+- keeps the current quest modes 0..12 unchanged;
+- TEST: displays ejector mode switches through Action Bar instead of normal chat.
 
 After this is tested, fold the same changes into agent_spider.py before merging to main.
 """
@@ -17,7 +18,7 @@ import pyspigot as ps
 
 from java.lang import System, Byte as JByte
 from java.util import ArrayList
-from org.bukkit import Bukkit, Material
+from org.bukkit import Bukkit, Material, Sound
 from org.bukkit.inventory import ItemStack
 from org.bukkit.persistence import PersistentDataType
 from com.destroystokyo.paper.profile import ProfileProperty
@@ -73,8 +74,6 @@ def _skinsrestorer_api():
                 return None
             loader = plugin.getClass().getClassLoader()
             provider_cls = loader.loadClass("net.skinsrestorer.api.SkinsRestorerProvider")
-            # Java reflection varargs are awkward from Jython; getDeclaredMethods avoids
-            # constructing a Class[] just to call the public static no-arg get().
             for method in provider_cls.getDeclaredMethods():
                 if method.getName() == "get" and method.getParameterTypes().length == 0:
                     return method.invoke(None)
@@ -97,12 +96,8 @@ def _profile_from_skinsrestorer():
         owner_uuid = offline.getUniqueId()
         player_storage = api.getPlayerStorage()
 
-        # Explicit isOnlineMode=False is important: this server runs offline-mode and
-        # SkinsRestorer may have a custom/default/url skin linked to the offline UUID.
         optional = player_storage.getSkinForPlayer(owner_uuid, HEAD_OWNER, False)
         if optional is None or not optional.isPresent():
-            # If a player has a directly linked skin identifier, this path can still
-            # retrieve it without asking providers for a new Mojang profile.
             try:
                 optional = player_storage.getSkinOfPlayer(owner_uuid)
             except Exception:
@@ -197,9 +192,9 @@ def _install():
         return False
 
     required = (
-        "KEY_MASK", "KEY_EJECTOR", "MODE_INFO", "wearing_mask", "is_silenced_by_demiurg",
-        "ultimate_lock", "uid", "check_cd", "_try_consume_ammo", "do_web_ball",
-        "launch_web", "set_cd", "CD_GRENADE"
+        "KEY_MASK", "KEY_EJECTOR", "MODE_INFO", "player_mode", "wearing_mask",
+        "is_silenced_by_demiurg", "ultimate_lock", "uid", "check_cd",
+        "_try_consume_ammo", "do_web_ball", "launch_web", "set_cd", "CD_GRENADE"
     )
     for key in required:
         if key not in g:
@@ -269,9 +264,36 @@ def _install():
             ]))
             item.setItemMeta(meta)
 
+    # Preserve all modern modes and append the two accidentally lost legacy modes.
     g["MODE_INFO"][13] = (u"Паутинный шар", u"§f")
     g["MODE_INFO"][14] = (u"Паутинная граната", u"§a")
     g["MODE_MAX"] = 14
+
+    # TEST: mode selection no longer enters normal chat (and therefore bypasses
+    # ChatLagFix/ChatPatches). It is shown in the vanilla Action Bar instead.
+    def set_mode_actionbar_hotfix(player, mode):
+        mode = mode % (g["MODE_MAX"] + 1)
+        g["player_mode"][g["uid"](player)] = mode
+        name, color = g["MODE_INFO"][mode]
+        text = u"§8⌬ §fРежим эжектора: " + color + name + u" §7[" + str(mode) + u"]"
+
+        def show_again():
+            try:
+                # Do not replay stale text if the player scrolled again during the delay.
+                if g["player_mode"].get(g["uid"](player), 0) == mode and player.isOnline():
+                    player.sendActionBar(text)
+            except Exception:
+                pass
+
+        try:
+            player.sendActionBar(text)
+        except Exception as ex:
+            Bukkit.getLogger().warning("[spider_hotfix] actionbar failed: " + str(ex))
+        scheduler.runTaskLater(show_again, 2)
+        try:
+            player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.6, 1.7)
+        except Exception:
+            pass
 
     original_fire = g["fire_ejector"]
 
@@ -316,6 +338,7 @@ def _install():
     g["create_mask"] = create_mask_hotfix
     g["create_ejector"] = create_ejector_hotfix
     g["update_ejector_lore"] = update_ejector_lore_hotfix
+    g["set_mode"] = set_mode_actionbar_hotfix
     g["fire_ejector"] = fire_ejector_hotfix
     g["_spider_mirror_mask"] = mirror_mask_hotfix
 
@@ -329,7 +352,7 @@ def _install():
         pass
 
     Bukkit.getLogger().info(
-        "[spider_hotfix] installed: SkinsRestorer-backed BigBoyeDuniel head + Web Ball + Web Grenade"
+        "[spider_hotfix] installed: SR head + Web Ball/Grenade + ActionBar mode test"
     )
     return True
 

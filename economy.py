@@ -981,7 +981,7 @@ class EconomyManager(object):
             self._saving = False
             self._lock.release()
 
-    def _get_or_create_in_memory(self, uuid_str, name):
+    def _get_or_create_in_memory(self, uuid_str, name, update_name=True):
         uuid_key = str(uuid_str)
         unicode_name = to_unicode(name)
         acc = self.accounts.get(uuid_key)
@@ -990,10 +990,80 @@ class EconomyManager(object):
             acc = Account(uuid_key, unicode_name)
             self.accounts[uuid_key] = acc
         else:
-            acc.update_last_seen(unicode_name)
-        if unicode_name and unicode_name != u"Unknown":
+            # Balance mutations (dividends/refunds/etc.) are allowed to touch
+            # money and last_seen, but must never rename an existing UUID.
+            # Only trusted identity paths such as PlayerJoin/get_or_create_account
+            # may update the stored player name.
+            if update_name:
+                old_name = to_unicode(acc.name).strip() if acc.name else u""
+                acc.update_last_seen(unicode_name)
+                if old_name and old_name.lower() != unicode_name.lower():
+                    mapped = self.name_to_uuid.get(old_name.lower())
+                    if mapped == uuid_key:
+                        self.name_to_uuid.pop(old_name.lower(), None)
+            else:
+                acc.update_last_seen()
+        if unicode_name and unicode_name != u"Unknown" and (created or update_name):
             self.name_to_uuid[unicode_name.lower()] = uuid_key
         return acc, created
+
+    @staticmethod
+    def _is_placeholder_account_name(name):
+        value = to_unicode(name).strip().lower() if name is not None else u""
+        return value in (u"", u"unknown", u"investor", u"{minecraft_username}")
+
+    def _offline_name_for_uuid(self, uuid_str):
+        if not BUKKIT_AVAILABLE or JavaUUID is None:
+            return None
+        try:
+            offline = Bukkit.getOfflinePlayer(JavaUUID.fromString(str(uuid_str)))
+            if offline is None:
+                return None
+            name = offline.getName()
+            if name and not self._is_placeholder_account_name(name):
+                return to_unicode(name)
+        except Exception:
+            pass
+        return None
+
+    def _name_for_new_credit_account(self, uuid_str, supplied_name=None):
+        # UUID is authoritative. Prefer Bukkit's UUID -> last known Minecraft
+        # name mapping; a supplied label is only a fallback for a brand-new
+        # account and is never used to rename an existing account.
+        resolved = self._offline_name_for_uuid(uuid_str)
+        if resolved:
+            return resolved
+        if supplied_name is not None and not self._is_placeholder_account_name(supplied_name):
+            return to_unicode(supplied_name)
+        return u"Unknown"
+
+    def repair_corrupted_account_names(self):
+        # One-shot/idempotent repair for the old companies.py dividend bug,
+        # which stored literal labels such as "Investor" as player names.
+        repaired = 0
+        self._lock.acquire()
+        try:
+            for uuid_key, acc in self.accounts.items():
+                if not self._is_placeholder_account_name(acc.name):
+                    continue
+                resolved = self._offline_name_for_uuid(uuid_key)
+                if not resolved:
+                    continue
+                acc.name = resolved
+                acc.last_seen = int(time.time())
+                repaired += 1
+
+            if repaired:
+                rebuilt = {}
+                for uuid_key, acc in self.accounts.items():
+                    name = to_unicode(acc.name).strip() if acc.name else u""
+                    if name and not self._is_placeholder_account_name(name):
+                        rebuilt[name.lower()] = str(uuid_key)
+                self.name_to_uuid = rebuilt
+                invalidate_baltop_cache()
+        finally:
+            self._lock.release()
+        return repaired
 
     def get_or_create_account(self, uuid_str, name):
         manager = self.current_manager()
@@ -1060,7 +1130,8 @@ class EconomyManager(object):
         uuid_key = str(uuid_str)
         self._lock.acquire()
         try:
-            acc, created = self._get_or_create_in_memory(uuid_key, name if name else u"Unknown")
+            credit_name = self._name_for_new_credit_account(uuid_key, name)
+            acc, created = self._get_or_create_in_memory(uuid_key, credit_name, update_name=False)
             old_balance = acc.balance
             new_balance = old_balance + safe
             if new_balance > EconomyConfig.MAX_BALANCE:
@@ -1122,7 +1193,8 @@ class EconomyManager(object):
             source = self.accounts.get(from_key)
             if source is None or source.balance < safe:
                 return False, self.get_balance(from_key), self.get_balance(to_key)
-            target, created = self._get_or_create_in_memory(to_key, to_name if to_name else u"Unknown")
+            target_name = self._name_for_new_credit_account(to_key, to_name)
+            target, created = self._get_or_create_in_memory(to_key, target_name, update_name=False)
             if target.balance + safe > EconomyConfig.MAX_BALANCE:
                 if created:
                     self.accounts.pop(to_key, None)
@@ -1154,7 +1226,8 @@ class EconomyManager(object):
         uuid_key = str(uuid_str)
         self._lock.acquire()
         try:
-            acc, created = self._get_or_create_in_memory(uuid_key, name if name else u"Unknown")
+            account_name = self._name_for_new_credit_account(uuid_key, name)
+            acc, created = self._get_or_create_in_memory(uuid_key, account_name, update_name=False)
             old_balance = acc.balance
             acc.balance = round(safe, 2)
             if not self.save_database():
@@ -3117,6 +3190,9 @@ def on_enable():
             except Exception:
                 pass
         economy._active = True
+        repaired_names = economy.repair_corrupted_account_names()
+        if repaired_names:
+            log_info(u"Repaired {0} corrupted economy account name(s) from Bukkit UUID data.".format(repaired_names))
         # Creates the first file when the database does not exist and upgrades
         # the on-disk format only after this manager becomes authoritative.
         if not economy.save_database():

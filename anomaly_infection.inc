@@ -14,9 +14,14 @@ except Exception:
 INF_PROPERTY = "SmartY_AnomalyInfectionController"
 INF_FILE = os.path.join(AnomalyConfig.DATA_DIR, "anomaly-infections.json")
 INF_BACKUP = INF_FILE + ".bak"
+INF_SPREAD_LOG = os.path.join(AnomalyConfig.DATA_DIR, "anomaly-infection-spread.log")
 
 INF_ZONE_INTERVAL = 5
 INF_ZONE_CHANCE = 0.25
+# Only the first three natural carriers can be infected directly by zones.
+# ADMIN infections do not consume this quota; after it is exhausted the
+# epidemic can continue only through CONTACT transmission.
+INF_ZONE_SEED_LIMIT = 3
 INF_STAGE1_SECONDS = 2 * 3600
 INF_STAGE2_SECONDS = 4 * 3600
 INF_STAGE1_LATENT_SECONDS = 20 * 60
@@ -77,14 +82,40 @@ class AnomalyInfectionController(object):
         self.old_tab = None
         self._normalize()
 
+    # ------------------------------------------------------------------
+    # persistence / infection history
+    # ------------------------------------------------------------------
+
     def _default(self):
-        return {"schema_version": 1, "players": {}}
+        return {"schema_version": 2, "players": {}, "events": []}
+
+    def _history_event_from_record(self, record):
+        return {
+            "event_id": u"legacy:{0}:{1}".format(
+                safe_int(record.get("infected_at"), 0),
+                to_unicode(record.get("uuid") or u"unknown")
+            ),
+            "infected_at": safe_int(record.get("infected_at"), now_ts()),
+            "target_uuid": to_unicode(record.get("uuid")),
+            "target_name": to_unicode(record.get("name") or u"?"),
+            "source": to_unicode(record.get("source") or u"UNKNOWN"),
+            "source_anomaly_id": record.get("source_anomaly_id"),
+            "source_player_uuid": record.get("source_player_uuid"),
+            "source_player_name": record.get("source_player_name"),
+            "generation": safe_int(record.get("generation"), 0),
+            "contact_distance": record.get("source_contact_distance"),
+            "contact_chance": record.get("source_contact_chance")
+        }
 
     def _normalize(self):
         if not isinstance(self.data, dict):
             self.data = self._default()
+        self.data["schema_version"] = 2
         if not isinstance(self.data.get("players"), dict):
             self.data["players"] = {}
+        if not isinstance(self.data.get("events"), list):
+            self.data["events"] = []
+
         for uid_key in list(self.data["players"].keys()):
             record = self.data["players"].get(uid_key)
             if not isinstance(record, dict):
@@ -98,8 +129,22 @@ class AnomalyInfectionController(object):
             record.setdefault("source", "UNKNOWN")
             record.setdefault("source_anomaly_id", None)
             record.setdefault("source_player_uuid", None)
+            record.setdefault("source_player_name", None)
+            record.setdefault("generation", 0)
+            record.setdefault("root_source", record.get("source", "UNKNOWN"))
+            record.setdefault("root_anomaly_id", record.get("source_anomaly_id"))
+            record.setdefault("source_contact_distance", None)
+            record.setdefault("source_contact_chance", None)
             record.setdefault("insomnia_night_key", None)
             record.setdefault("insomnia_blocked", False)
+
+        # Upgrade from schema v1. We cannot reconstruct already-cleared old
+        # infections, but preserve every currently infected player as a legacy
+        # event so the zone seed counter and statistics remain conservative.
+        if not self.data.get("events") and self.data.get("players"):
+            for record in self.data["players"].values():
+                if isinstance(record, dict):
+                    self.data["events"].append(self._history_event_from_record(record))
 
     def _load_path(self, path):
         with open(path, "r") as handle:
@@ -128,7 +173,13 @@ class AnomalyInfectionController(object):
                 os.makedirs(AnomalyConfig.DATA_DIR)
             temp = INF_FILE + ".tmp"
             with open(temp, "w") as handle:
-                handle.write(json.dumps(self.data, indent=2, ensure_ascii=True, sort_keys=True, allow_nan=False))
+                handle.write(json.dumps(
+                    self.data,
+                    indent=2,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    allow_nan=False
+                ))
                 handle.flush()
                 try:
                     os.fsync(handle.fileno())
@@ -147,12 +198,63 @@ class AnomalyInfectionController(object):
             log_error(u"Cannot save anomaly-infections.json", exc)
             return False
 
+    def _append_spread_log(self, event):
+        try:
+            source = to_unicode(event.get("source") or u"UNKNOWN")
+            target_name = to_unicode(event.get("target_name") or u"?")
+            target_uuid = to_unicode(event.get("target_uuid") or u"-")
+            if source == u"CONTACT":
+                detail = (
+                    u"target={0} target_uuid={1} source=CONTACT "
+                    u"source_player={2} source_uuid={3} generation={4} "
+                    u"distance={5} chance={6}"
+                ).format(
+                    target_name,
+                    target_uuid,
+                    to_unicode(event.get("source_player_name") or u"?"),
+                    to_unicode(event.get("source_player_uuid") or u"-"),
+                    safe_int(event.get("generation"), 0),
+                    event.get("contact_distance"),
+                    event.get("contact_chance")
+                )
+            elif source == u"ZONE":
+                detail = u"target={0} target_uuid={1} source=ZONE anomaly={2} generation=0".format(
+                    target_name,
+                    target_uuid,
+                    to_unicode(event.get("source_anomaly_id") or u"-")
+                )
+            else:
+                detail = u"target={0} target_uuid={1} source={2} generation={3}".format(
+                    target_name,
+                    target_uuid,
+                    source,
+                    safe_int(event.get("generation"), 0)
+                )
+            append_utf8_log(INF_SPREAD_LOG, "INFECTION", detail)
+        except Exception as exc:
+            log_error(u"Cannot append infection spread log", exc)
+
+    def _zone_seed_count(self):
+        count = 0
+        for event in self.data.get("events", []):
+            if isinstance(event, dict) and to_unicode(event.get("source")).upper() == u"ZONE":
+                count += 1
+        return count
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
     def start(self):
         self.active = True
         self._register_event(PlayerBedEnterEvent, self.on_bed, EventPriority.HIGHEST)
         self._schedule(self.tick, 20, 20)
         self._patch_commands()
-        log_action(u"Infection system started; infected={0}.".format(len(self.data.get("players", {}))))
+        log_action(u"Infection system started; infected={0}; zone_seeds={1}/{2}.".format(
+            len(self.data.get("players", {})),
+            self._zone_seed_count(),
+            INF_ZONE_SEED_LIMIT
+        ))
 
     def stop(self):
         self.active = False
@@ -181,12 +283,20 @@ class AnomalyInfectionController(object):
     def _register_event(self, event_class, callback, priority):
         listener = EmptyListener()
         executor = CallbackExecutor(callback)
-        Bukkit.getPluginManager().registerEvent(event_class, listener, priority, executor, self.plugin, False)
+        Bukkit.getPluginManager().registerEvent(
+            event_class, listener, priority, executor, self.plugin, False
+        )
         self.listeners.append(listener)
 
     def _schedule(self, callback, delay, period):
-        task = Bukkit.getScheduler().runTaskTimer(self.plugin, CallbackRunnable(callback), int(delay), int(period))
+        task = Bukkit.getScheduler().runTaskTimer(
+            self.plugin, CallbackRunnable(callback), int(delay), int(period)
+        )
         self.task_ids.append(int(task.getTaskId()))
+
+    # ------------------------------------------------------------------
+    # records / infection events
+    # ------------------------------------------------------------------
 
     def uid(self, player):
         return str(player.getUniqueId())
@@ -194,39 +304,127 @@ class AnomalyInfectionController(object):
     def record(self, player):
         return self.data.get("players", {}).get(self.uid(player))
 
-    def infect(self, player, source="ZONE", anomaly=None, source_player=None, stage=1):
+    def infect(self, player, source="ZONE", anomaly=None,
+               source_player=None, stage=1,
+               contact_distance=None, contact_chance=None):
         uid_key = self.uid(player)
         if uid_key in self.data.setdefault("players", {}):
             return False
+
+        source_text = to_unicode(source).upper()
+        if source_text == u"ZONE" and self._zone_seed_count() >= INF_ZONE_SEED_LIMIT:
+            return False
+
         now = now_ts()
         stage = max(1, min(3, safe_int(stage, 1)))
+        source_uuid = None
+        source_name = None
+        generation = 0
+        root_source = source_text
+        root_anomaly_id = anomaly.get("id") if isinstance(anomaly, dict) else None
+
+        if source_player is not None:
+            try:
+                source_uuid = self.uid(source_player)
+                source_name = to_unicode(source_player.getName())
+            except Exception:
+                source_uuid = None
+                source_name = None
+            parent = self.record(source_player)
+            if isinstance(parent, dict):
+                generation = safe_int(parent.get("generation"), 0) + 1
+                root_source = to_unicode(parent.get("root_source") or parent.get("source") or u"CONTACT")
+                root_anomaly_id = parent.get("root_anomaly_id") or parent.get("source_anomaly_id")
+            else:
+                generation = 1
+                root_source = u"CONTACT"
+
+        if contact_distance is not None:
+            try:
+                contact_distance = round(float(contact_distance), 2)
+            except Exception:
+                contact_distance = None
+        if contact_chance is not None:
+            try:
+                contact_chance = round(float(contact_chance), 4)
+            except Exception:
+                contact_chance = None
+
         record = {
             "uuid": uid_key,
             "name": to_unicode(player.getName()),
             "infected_at": now,
             "stage": stage,
             "stage_started_at": now,
-            "source": to_unicode(source),
+            "source": source_text,
             "source_anomaly_id": anomaly.get("id") if isinstance(anomaly, dict) else None,
-            "source_player_uuid": self.uid(source_player) if source_player is not None else None,
+            "source_player_uuid": source_uuid,
+            "source_player_name": source_name,
+            "generation": generation,
+            "root_source": root_source,
+            "root_anomaly_id": root_anomaly_id,
+            "source_contact_distance": contact_distance,
+            "source_contact_chance": contact_chance,
             "insomnia_night_key": None,
             "insomnia_blocked": False
         }
+        event = {
+            "event_id": u"{0}:{1}:{2}".format(
+                now, uid_key, len(self.data.setdefault("events", [])) + 1
+            ),
+            "infected_at": now,
+            "target_uuid": uid_key,
+            "target_name": to_unicode(player.getName()),
+            "source": source_text,
+            "source_anomaly_id": record.get("source_anomaly_id"),
+            "source_player_uuid": source_uuid,
+            "source_player_name": source_name,
+            "generation": generation,
+            "root_source": root_source,
+            "root_anomaly_id": root_anomaly_id,
+            "contact_distance": contact_distance,
+            "contact_chance": contact_chance
+        }
+
         self.data["players"][uid_key] = record
+        self.data["events"].append(event)
         self.zone_next.pop(uid_key, None)
         self.symptom_next[uid_key] = now + random.randint(120, 300)
+
         if not self._save():
             self.data["players"].pop(uid_key, None)
+            try:
+                self.data["events"].remove(event)
+            except Exception:
+                pass
             return False
-        log_action(u"Player infected: {0}, source={1}, anomaly={2}.".format(player.getName(), source, record.get("source_anomaly_id") or "-"))
+
+        self._append_spread_log(event)
+        if source_text == u"CONTACT":
+            log_action(u"Player infected: {0} <- {1}; distance={2}; chance={3}; generation={4}.".format(
+                player.getName(), source_name or u"?", contact_distance,
+                contact_chance, generation
+            ))
+        else:
+            log_action(u"Player infected: {0}, source={1}, anomaly={2}, generation={3}.".format(
+                player.getName(), source_text,
+                record.get("source_anomaly_id") or "-", generation
+            ))
         return True
 
     def clear(self, player):
+        # Clear only the active infection. Historical transmission events stay
+        # permanently available for end-of-event statistics.
         uid_key = self.uid(player)
         removed = self.data.setdefault("players", {}).pop(uid_key, None)
         self.zone_next.pop(uid_key, None)
         self.symptom_next.pop(uid_key, None)
         self.compass_next.pop(uid_key, None)
+        try:
+            if hasattr(self, "hallucination_next"):
+                self.hallucination_next.pop(uid_key, None)
+        except Exception:
+            pass
         try:
             player.setCompassTarget(player.getWorld().getSpawnLocation())
         except Exception:
@@ -234,8 +432,36 @@ class AnomalyInfectionController(object):
         if removed is None:
             return False
         self._save()
-        log_action(u"Infection cleared administratively: {0}.".format(player.getName()))
+        log_action(u"Infection cleared administratively: {0}; history preserved.".format(
+            player.getName()
+        ))
         return True
+
+    def reset_all(self):
+        # Hidden destructive test/admin helper. Requires explicit "confirm" in
+        # the command handler. It resets both active infections and history.
+        try:
+            for player in Bukkit.getOnlinePlayers():
+                try:
+                    player.setCompassTarget(player.getWorld().getSpawnLocation())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.data = self._default()
+        self.zone_next = {}
+        self.symptom_next = {}
+        self.compass_next = {}
+        self.contact_next = 0
+        try:
+            self.hallucination_next = {}
+        except Exception:
+            pass
+        ok = self._save()
+        if ok:
+            append_utf8_log(INF_SPREAD_LOG, "RESET", u"infection state and history reset by admin")
+            log_action(u"Infection state and spread history reset administratively.")
+        return ok
 
     def set_stage(self, player, stage):
         stage = max(1, min(3, safe_int(stage, 1)))
@@ -248,8 +474,14 @@ class AnomalyInfectionController(object):
         record["insomnia_blocked"] = False
         self.symptom_next[self.uid(player)] = now_ts() + 5
         self._save()
-        log_action(u"Infection stage set: {0} -> {1}.".format(player.getName(), stage))
+        log_action(u"Infection stage set: {0} -> {1}.".format(
+            player.getName(), stage
+        ))
         return True
+
+    # ------------------------------------------------------------------
+    # effects
+    # ------------------------------------------------------------------
 
     def _sound(self, name):
         if _InfSound is None:
@@ -266,7 +498,9 @@ class AnomalyInfectionController(object):
         try:
             if pitch is None:
                 pitch = random.uniform(0.55, 1.30)
-            player.playSound(player.getLocation(), sound, float(volume), float(pitch))
+            player.playSound(
+                player.getLocation(), sound, float(volume), float(pitch)
+            )
         except Exception:
             pass
 
@@ -283,15 +517,22 @@ class AnomalyInfectionController(object):
         return None
 
     def _particles(self, player, public, count):
-        particle = self._particle(("SCULK_SOUL", "SOUL", "ASH")) if public else self._particle(("ASH", "SOUL", "PORTAL"))
+        if public:
+            particle = self._particle(("SCULK_SOUL", "SOUL", "ASH"))
+        else:
+            particle = self._particle(("ASH", "SOUL", "PORTAL"))
         if particle is None:
             return
         try:
             loc = player.getLocation().clone().add(0.0, 0.18, 0.0)
             if public:
-                player.getWorld().spawnParticle(particle, loc, int(count), 0.45, 0.18, 0.45, 0.015)
+                player.getWorld().spawnParticle(
+                    particle, loc, int(count), 0.45, 0.18, 0.45, 0.015
+                )
             else:
-                player.spawnParticle(particle, loc, int(count), 0.35, 0.10, 0.35, 0.01)
+                player.spawnParticle(
+                    particle, loc, int(count), 0.35, 0.10, 0.35, 0.01
+                )
         except Exception:
             pass
 
@@ -299,16 +540,28 @@ class AnomalyInfectionController(object):
         if PotionEffect is None or effect_type is None:
             return
         try:
-            player.addPotionEffect(PotionEffect(effect_type, int(seconds * 20), 0, False, False, False), True)
+            player.addPotionEffect(PotionEffect(
+                effect_type, int(seconds * 20), 0, False, False, False
+            ), True)
         except Exception:
             pass
 
     def _puke(self, player, minimum, maximum):
         try:
             amount = random.randint(int(minimum), int(maximum))
-            Bukkit.dispatchCommand(Bukkit.getConsoleSender(), to_java_string(u"brew puke {0} {1}".format(player.getName(), amount)))
+            Bukkit.dispatchCommand(
+                Bukkit.getConsoleSender(),
+                to_java_string(u"brew puke {0} {1}".format(
+                    player.getName(), amount
+                ))
+            )
         except Exception as exc:
-            self.manager.log_error_throttled("infection-puke", u"Brewery /brew puke integration failed", exc, 120)
+            self.manager.log_error_throttled(
+                "infection-puke",
+                u"Brewery /brew puke integration failed",
+                exc,
+                120
+            )
 
     def _symptom_delay(self, stage):
         if stage <= 1:
@@ -318,7 +571,12 @@ class AnomalyInfectionController(object):
         return random.randint(INF_STAGE3_SYMPTOM_MIN, INF_STAGE3_SYMPTOM_MAX)
 
     def _stage1_symptom(self, player, record, now):
-        strange = ("AMBIENT_CAVE", "BLOCK_SCULK_SENSOR_CLICKING", "ENTITY_ENDERMAN_STARE", "BLOCK_RESPAWN_ANCHOR_DEPLETE")
+        strange = (
+            "AMBIENT_CAVE",
+            "BLOCK_SCULK_SENSOR_CLICKING",
+            "ENTITY_ENDERMAN_STARE",
+            "BLOCK_RESPAWN_ANCHOR_DEPLETE"
+        )
         infected_at = safe_int(record.get("infected_at"), now)
         if now - infected_at < INF_STAGE1_LATENT_SECONDS:
             self._play_private(player, strange, 0.30)
@@ -336,8 +594,18 @@ class AnomalyInfectionController(object):
                 self._puke(player, 1, 2)
 
     def _stage2_or_3_symptom(self, player, stage):
-        sculk = ("BLOCK_SCULK_SENSOR_CLICKING", "BLOCK_SCULK_SHRIEKER_SHRIEK", "ENTITY_WARDEN_HEARTBEAT", "ENTITY_WARDEN_AMBIENT")
-        strange = ("AMBIENT_CAVE", "ENTITY_ENDERMAN_STARE", "BLOCK_RESPAWN_ANCHOR_DEPLETE", "BLOCK_PORTAL_AMBIENT")
+        sculk = (
+            "BLOCK_SCULK_SENSOR_CLICKING",
+            "BLOCK_SCULK_SHRIEKER_SHRIEK",
+            "ENTITY_WARDEN_HEARTBEAT",
+            "ENTITY_WARDEN_AMBIENT"
+        )
+        strange = (
+            "AMBIENT_CAVE",
+            "ENTITY_ENDERMAN_STARE",
+            "BLOCK_RESPAWN_ANCHOR_DEPLETE",
+            "BLOCK_PORTAL_AMBIENT"
+        )
         self._play_private(player, sculk, 0.50)
         if random.random() < 0.70:
             self._play_private(player, strange, 0.30)
@@ -349,13 +617,20 @@ class AnomalyInfectionController(object):
             if random.random() < (0.40 if stage == 2 else 0.55):
                 self._puke(player, 2, 4 if stage == 2 else 5)
 
+    # ------------------------------------------------------------------
+    # progression / exposure / contact spread
+    # ------------------------------------------------------------------
+
     def _progress_and_symptoms(self, players, now):
         for player in players:
             record = self.record(player)
             if record is None:
                 continue
             stage = safe_int(record.get("stage"), 1, 1, 3)
-            started = safe_int(record.get("stage_started_at"), record.get("infected_at", now))
+            started = safe_int(
+                record.get("stage_started_at"),
+                record.get("infected_at", now)
+            )
             required = INF_STAGE1_SECONDS if stage == 1 else INF_STAGE2_SECONDS
             if stage < 3 and now - started >= required:
                 stage += 1
@@ -365,7 +640,9 @@ class AnomalyInfectionController(object):
                 record["insomnia_blocked"] = False
                 self.symptom_next[self.uid(player)] = now + random.randint(20, 60)
                 self._save()
-                log_action(u"Infection progressed: {0} -> stage {1}.".format(player.getName(), stage))
+                log_action(u"Infection progressed: {0} -> stage {1}.".format(
+                    player.getName(), stage
+                ))
             due = safe_int(self.symptom_next.get(self.uid(player)), 0)
             if due <= 0:
                 self.symptom_next[self.uid(player)] = now + self._symptom_delay(stage)
@@ -379,8 +656,15 @@ class AnomalyInfectionController(object):
                 self._random_compass(player, now)
 
     def _zone_exposure(self, players, now):
+        seed_count = self._zone_seed_count()
+        if seed_count >= INF_ZONE_SEED_LIMIT:
+            self.zone_next = {}
+            return
+
         online_healthy = set()
         for player in players:
+            if seed_count >= INF_ZONE_SEED_LIMIT:
+                break
             uid_key = self.uid(player)
             if self.record(player) is not None:
                 self.zone_next.pop(uid_key, None)
@@ -398,7 +682,9 @@ class AnomalyInfectionController(object):
                 continue
             self.zone_next[uid_key] = now + INF_ZONE_INTERVAL
             if random.random() < INF_ZONE_CHANCE:
-                self.infect(player, "ZONE", anomaly=anomaly, stage=1)
+                if self.infect(player, "ZONE", anomaly=anomaly, stage=1):
+                    seed_count += 1
+
         for uid_key in list(self.zone_next.keys()):
             if uid_key not in online_healthy:
                 self.zone_next.pop(uid_key, None)
@@ -424,6 +710,7 @@ class AnomalyInfectionController(object):
                 healthy.append(player)
             elif safe_int(record.get("stage"), 1, 1, 3) >= 2:
                 infectious.append(player)
+
         for target in healthy:
             nearest = None
             nearest_distance = INF_CONTACT_RADIUS + 1.0
@@ -437,18 +724,39 @@ class AnomalyInfectionController(object):
                         nearest_distance = distance
                 except Exception:
                     continue
-            if nearest is not None:
-                chance = self._contact_chance(nearest_distance)
-                if chance > 0.0 and random.random() < chance:
-                    self.infect(target, "CONTACT", anomaly=None, source_player=nearest, stage=1)
+            if nearest is None:
+                continue
+            chance = self._contact_chance(nearest_distance)
+            if chance > 0.0 and random.random() < chance:
+                self.infect(
+                    target,
+                    "CONTACT",
+                    anomaly=None,
+                    source_player=nearest,
+                    stage=1,
+                    contact_distance=nearest_distance,
+                    contact_chance=chance
+                )
+
+    # ------------------------------------------------------------------
+    # synchronized pulses / stage III
+    # ------------------------------------------------------------------
 
     def _pulse(self, player, stage):
         self._effect(player, _INF_DARKNESS, random.randint(2, 5))
-        self._play_private(player, ("ENTITY_WARDEN_HEARTBEAT", "BLOCK_SCULK_SENSOR_CLICKING"), 0.70, random.uniform(0.55, 0.80))
+        self._play_private(
+            player,
+            ("ENTITY_WARDEN_HEARTBEAT", "BLOCK_SCULK_SENSOR_CLICKING"),
+            0.70,
+            random.uniform(0.55, 0.80)
+        )
         try:
             sound = self._sound("BLOCK_SCULK_SENSOR_CLICKING")
             if sound is not None:
-                player.playSound(player.getLocation(), sound, 0.45, random.uniform(0.75, 1.05))
+                player.playSound(
+                    player.getLocation(), sound, 0.45,
+                    random.uniform(0.75, 1.05)
+                )
         except Exception:
             pass
         self._particles(player, stage >= 2, random.randint(5, 12))
@@ -483,7 +791,9 @@ class AnomalyInfectionController(object):
             limit = 29900000
             x = random.randint(-limit, limit)
             z = random.randint(-limit, limit)
-            player.setCompassTarget(Location(player.getWorld(), float(x) + 0.5, 64.0, float(z) + 0.5))
+            player.setCompassTarget(Location(
+                player.getWorld(), float(x) + 0.5, 64.0, float(z) + 0.5
+            ))
         except Exception:
             pass
 
@@ -494,7 +804,9 @@ class AnomalyInfectionController(object):
             if record is None or safe_int(record.get("stage"), 1, 1, 3) < 3:
                 return
             day = int(player.getWorld().getFullTime() // 24000)
-            night_key = u"{0}:{1}".format(to_unicode(player.getWorld().getName()), day)
+            night_key = u"{0}:{1}".format(
+                to_unicode(player.getWorld().getName()), day
+            )
             if to_unicode(record.get("insomnia_night_key")) != night_key:
                 record["insomnia_night_key"] = night_key
                 record["insomnia_blocked"] = random.random() < INF_INSOMNIA_CHANCE
@@ -503,7 +815,11 @@ class AnomalyInfectionController(object):
                 event.setCancelled(True)
                 send_message(player, u"&cВы страдаете бессонницей.")
         except Exception as exc:
-            self.manager.log_error_throttled("infection-insomnia", u"Infection insomnia handler failed", exc)
+            self.manager.log_error_throttled(
+                "infection-insomnia",
+                u"Infection insomnia handler failed",
+                exc
+            )
 
     def tick(self):
         if not self.active or self.manager is None or not self.manager.active:
@@ -519,7 +835,13 @@ class AnomalyInfectionController(object):
             self._progress_and_symptoms(players, now)
             self._global_pulses(players)
         except Exception as exc:
-            self.manager.log_error_throttled("infection-tick", u"Infection cycle failed", exc)
+            self.manager.log_error_throttled(
+                "infection-tick", u"Infection cycle failed", exc
+            )
+
+    # ------------------------------------------------------------------
+    # hidden admin controls / statistics
+    # ------------------------------------------------------------------
 
     def _online(self, name):
         try:
@@ -531,14 +853,142 @@ class AnomalyInfectionController(object):
         if player is not None:
             record = self.record(player)
             if record is None:
-                send_message(sender, AnomalyConfig.PREFIX + u"&7Игрок &f{0}&7 не заражён.".format(player.getName()))
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&7Игрок &f{0}&7 не заражён.".format(player.getName())
+                )
                 return True
-            send_message(sender, AnomalyConfig.PREFIX + u"&f{0}&7: стадия &f{1}&7, source=&f{2}&7, anomaly=&f{3}&7.".format(player.getName(), record.get("stage"), record.get("source"), record.get("source_anomaly_id") or u"-"))
+            source_detail = to_unicode(record.get("source") or u"UNKNOWN")
+            if source_detail == u"CONTACT":
+                source_detail += u" <- " + to_unicode(record.get("source_player_name") or u"?")
+            elif source_detail == u"ZONE":
+                source_detail += u" " + to_unicode(record.get("source_anomaly_id") or u"-")
+            send_message(
+                sender,
+                AnomalyConfig.PREFIX +
+                u"&f{0}&7: стадия &f{1}&7, source=&f{2}&7, generation=&f{3}&7.".format(
+                    player.getName(), record.get("stage"), source_detail,
+                    safe_int(record.get("generation"), 0)
+                )
+            )
             return True
+
         records = self.data.get("players", {})
-        send_message(sender, AnomalyConfig.PREFIX + u"&7Заражённых в журнале: &f{0}".format(len(records)))
-        for uid_key, record in sorted(records.items(), key=lambda item: to_unicode(item[1].get("name"))):
-            send_message(sender, u"&8- &f{0} &7S{1} source={2}".format(record.get("name") or uid_key, record.get("stage"), record.get("source")))
+        send_message(
+            sender,
+            AnomalyConfig.PREFIX +
+            u"&7Сейчас заражены: &f{0}&7; zone seeds: &f{1}/{2}".format(
+                len(records), self._zone_seed_count(), INF_ZONE_SEED_LIMIT
+            )
+        )
+        for uid_key, record in sorted(
+                records.items(),
+                key=lambda item: to_unicode(item[1].get("name"))
+        ):
+            source = to_unicode(record.get("source") or u"UNKNOWN")
+            if source == u"CONTACT":
+                source += u"<-" + to_unicode(record.get("source_player_name") or u"?")
+            send_message(
+                sender,
+                u"&8- &f{0} &7S{1} source={2} gen={3}".format(
+                    record.get("name") or uid_key,
+                    record.get("stage"), source,
+                    safe_int(record.get("generation"), 0)
+                )
+            )
+        return True
+
+    def _admin_stats(self, sender):
+        events = [e for e in self.data.get("events", []) if isinstance(e, dict)]
+        counts = {"ZONE": 0, "CONTACT": 0, "ADMIN": 0, "OTHER": 0}
+        spreaders = {}
+        seeds = []
+        max_generation = 0
+        for event in events:
+            source = to_unicode(event.get("source") or u"UNKNOWN").upper()
+            if source in counts:
+                counts[source] += 1
+            else:
+                counts["OTHER"] += 1
+            max_generation = max(max_generation, safe_int(event.get("generation"), 0))
+            if source == u"ZONE":
+                seeds.append(to_unicode(event.get("target_name") or u"?"))
+            elif source == u"CONTACT":
+                name = to_unicode(event.get("source_player_name") or u"?")
+                spreaders[name] = spreaders.get(name, 0) + 1
+
+        send_message(
+            sender,
+            AnomalyConfig.PREFIX +
+            u"&fСтатистика заражения: &7events=&f{0} &7ZONE=&f{1} &7CONTACT=&f{2} &7ADMIN=&f{3} &7max generation=&f{4}".format(
+                len(events), counts["ZONE"], counts["CONTACT"],
+                counts["ADMIN"], max_generation
+            )
+        )
+        send_message(
+            sender,
+            u"&7Первые носители от зон: &f{0}".format(
+                u", ".join(seeds) if seeds else u"-"
+            )
+        )
+        ranking = sorted(
+            spreaders.items(),
+            key=lambda item: (-item[1], item[0].lower())
+        )
+        if ranking:
+            send_message(sender, u"&7Кто заразил больше всего:")
+            for name, amount in ranking[:15]:
+                send_message(sender, u"&8- &f{0}&7: {1}".format(name, amount))
+        else:
+            send_message(sender, u"&7Передач CONTACT пока нет.")
+        return True
+
+    def _event_text(self, event):
+        target = to_unicode(event.get("target_name") or u"?")
+        source = to_unicode(event.get("source") or u"UNKNOWN").upper()
+        generation = safe_int(event.get("generation"), 0)
+        if source == u"CONTACT":
+            return u"{0} <- {1} [CONTACT, gen {2}, d={3}, p={4}]".format(
+                target,
+                to_unicode(event.get("source_player_name") or u"?"),
+                generation,
+                event.get("contact_distance"),
+                event.get("contact_chance")
+            )
+        if source == u"ZONE":
+            return u"{0} <- зона {1} [ZONE, gen 0]".format(
+                target, to_unicode(event.get("source_anomaly_id") or u"-")
+            )
+        return u"{0} <- {1} [gen {2}]".format(target, source, generation)
+
+    def _admin_history(self, sender, name=None):
+        events = [e for e in self.data.get("events", []) if isinstance(e, dict)]
+        if name:
+            low = to_unicode(name).lower()
+            events = [
+                event for event in events
+                if to_unicode(event.get("target_name")).lower() == low or
+                   to_unicode(event.get("source_player_name")).lower() == low
+            ]
+        if not events:
+            send_message(sender, AnomalyConfig.PREFIX + u"&7История заражений пуста.")
+            return True
+        selected = events[-30:]
+        send_message(
+            sender,
+            AnomalyConfig.PREFIX +
+            u"&7История заражений: показываю &f{0}&7 из &f{1}&7 записей.".format(
+                len(selected), len(events)
+            )
+        )
+        for event in selected:
+            send_message(sender, u"&8- &f" + self._event_text(event))
+        if len(events) > len(selected):
+            send_message(
+                sender,
+                u"&8Полная история: plugins/PySpigot/scripts/data/anomaly-infection-spread.log"
+            )
         return True
 
     def _admin(self, sender, args):
@@ -546,14 +996,43 @@ class AnomalyInfectionController(object):
             if len(args) >= 2:
                 player = self._online(args[1])
                 if player is None:
-                    send_message(sender, AnomalyConfig.PREFIX + u"&cИгрок должен быть онлайн.")
+                    send_message(
+                        sender,
+                        AnomalyConfig.PREFIX + u"&cИгрок должен быть онлайн."
+                    )
                     return True
                 return self._admin_status(sender, player)
             return self._admin_status(sender)
+
         sub = args[0].lower()
+
+        if sub == "stats":
+            return self._admin_stats(sender)
+
+        if sub == "history":
+            return self._admin_history(sender, args[1] if len(args) >= 2 else None)
+
+        if sub == "reset":
+            if len(args) < 2 or args[1].lower() != "confirm":
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&c/anomaly infection reset confirm &7— удалить ВСЕ заражения и историю"
+                )
+                return True
+            if self.reset_all():
+                send_message(sender, AnomalyConfig.PREFIX + u"&aЗаражения и история очищены.")
+            else:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cНе удалось сохранить сброс.")
+            return True
+
         if sub == "infect":
             if len(args) < 2:
-                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly infection infect <игрок> [1|2|3]")
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&c/anomaly infection infect <игрок> [1|2|3]"
+                )
                 return True
             player = self._online(args[1])
             if player is None:
@@ -561,11 +1040,20 @@ class AnomalyInfectionController(object):
                 return True
             stage = safe_int(args[2], 1, 1, 3) if len(args) >= 3 else 1
             ok = self.infect(player, "ADMIN", stage=stage)
-            send_message(sender, AnomalyConfig.PREFIX + (u"&aЗаражение выдано." if ok else u"&eИгрок уже заражён или запись не сохранилась."))
+            send_message(
+                sender,
+                AnomalyConfig.PREFIX +
+                (u"&aЗаражение выдано." if ok else u"&eИгрок уже заражён или запись не сохранилась.")
+            )
             return True
+
         if sub == "stage":
             if len(args) < 3:
-                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly infection stage <игрок> <1|2|3>")
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&c/anomaly infection stage <игрок> <1|2|3>"
+                )
                 return True
             player = self._online(args[1])
             if player is None:
@@ -576,19 +1064,33 @@ class AnomalyInfectionController(object):
                 send_message(sender, AnomalyConfig.PREFIX + u"&cСтадия: 1, 2 или 3.")
                 return True
             self.set_stage(player, stage)
-            send_message(sender, AnomalyConfig.PREFIX + u"&aСтадия {0} установлена для {1}.".format(stage, player.getName()))
+            send_message(
+                sender,
+                AnomalyConfig.PREFIX +
+                u"&aСтадия {0} установлена для {1}.".format(stage, player.getName())
+            )
             return True
+
         if sub in ("clear", "cure"):
             if len(args) < 2:
-                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly infection clear <игрок>")
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&c/anomaly infection clear <игрок>"
+                )
                 return True
             player = self._online(args[1])
             if player is None:
                 send_message(sender, AnomalyConfig.PREFIX + u"&cИгрок должен быть онлайн.")
                 return True
             ok = self.clear(player)
-            send_message(sender, AnomalyConfig.PREFIX + (u"&aЗаражение очищено." if ok else u"&eИгрок не был заражён."))
+            send_message(
+                sender,
+                AnomalyConfig.PREFIX +
+                (u"&aЗаражение очищено; история сохранена." if ok else u"&eИгрок не был заражён.")
+            )
             return True
+
         return self._admin_status(sender)
 
     def _patch_commands(self):
@@ -600,7 +1102,11 @@ class AnomalyInfectionController(object):
 
         def handle(sender, args):
             converted = [to_unicode(value) for value in args]
-            if converted and converted[0].lower() == "infection" and controller.manager.is_admin(sender):
+            if (
+                    converted and
+                    converted[0].lower() == "infection" and
+                    controller.manager.is_admin(sender)
+            ):
                 return controller._admin(sender, converted[1:])
             return old_handle(sender, args)
 
@@ -618,16 +1124,33 @@ class AnomalyInfectionController(object):
                 return old_tab(sender, args)
             if len(converted) == 2:
                 prefix = converted[-1].lower()
-                return [item for item in ("list", "status", "infect", "stage", "clear") if item.startswith(prefix)]
-            if len(converted) == 3 and converted[1].lower() in ("status", "infect", "stage", "clear"):
+                return [
+                    item for item in
+                    ("list", "status", "stats", "history", "infect", "stage", "clear", "reset")
+                    if item.startswith(prefix)
+                ]
+            if (
+                    len(converted) == 3 and
+                    converted[1].lower() in
+                    ("status", "history", "infect", "stage", "clear")
+            ):
                 prefix = converted[-1].lower()
                 try:
-                    return [to_unicode(player.getName()) for player in Bukkit.getOnlinePlayers() if to_unicode(player.getName()).lower().startswith(prefix)]
+                    return [
+                        to_unicode(player.getName())
+                        for player in Bukkit.getOnlinePlayers()
+                        if to_unicode(player.getName()).lower().startswith(prefix)
+                    ]
                 except Exception:
                     return []
-            if len(converted) == 4 and converted[1].lower() in ("infect", "stage"):
+            if (
+                    len(converted) == 4 and
+                    converted[1].lower() in ("infect", "stage")
+            ):
                 prefix = converted[-1]
                 return [value for value in ("1", "2", "3") if value.startswith(prefix)]
+            if len(converted) == 3 and converted[1].lower() == "reset":
+                return ["confirm"] if "confirm".startswith(converted[-1].lower()) else []
             return []
 
         self.manager.handle_command = handle

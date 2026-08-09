@@ -197,14 +197,31 @@ try:
             if uid_key not in online:
                 self.hallucination_next.pop(uid_key, None)
 
+    def _unique_zone_seed_count(self):
+        """Count unique natural carriers, not repeated ZONE events."""
+        seed_keys = set()
+        for event in self.data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if to_unicode(event.get("source") or u"").upper() != u"ZONE":
+                continue
+            uid_key = to_unicode(event.get("target_uuid") or u"").strip()
+            if uid_key:
+                seed_keys.add(u"uuid:" + uid_key)
+            else:
+                # Legacy fallback for an old event without UUID.
+                seed_keys.add(u"name:" + to_unicode(event.get("target_name") or u"?").lower())
+        return len(seed_keys)
+
     AnomalyInfectionController._puke = _production_puke
     AnomalyInfectionController._global_pulses = _production_global_pulses
     AnomalyInfectionController._progress_and_symptoms = _production_progress_and_symptoms
+    AnomalyInfectionController._zone_seed_count = _unique_zone_seed_count
 
     if infection_controller is not None:
         infection_controller.hallucination_next = {}
 
-    log_action(u"Infection tuning installed: zone=20%, pulse=30m S2-S3, puke=15-40, hallucinations enabled.")
+    log_action(u"Infection tuning installed: zone=20%, unique zone seeds=3, pulse=30m S2-S3, puke=15-40, hallucinations enabled.")
 except Exception as _infection_tuning_error:
     try:
         log_error(u"Cannot install infection tuning", _infection_tuning_error)

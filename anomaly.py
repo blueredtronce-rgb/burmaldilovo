@@ -2,46 +2,54 @@
 """
 SmartY-Anomalies test-cg entrypoint.
 
-The production anomaly implementation is preserved byte-for-byte in
-anomaly_core.py from branch for-cg.  This entrypoint executes that exact core
-in the same script namespace, then attaches the test infection extension from
-anomaly_infection.py.
+Windows/PySpigot-safe layout:
+- anomaly.py is the only executable PySpigot script.
+- anomaly_core.inc contains the exact production anomaly implementation from for-cg.
+- anomaly_infection.inc contains the additive infection extension.
 
-Deploy all three test-cg files together:
-  anomaly.py
-  anomaly_core.py
-  anomaly_infection.py
+PySpigot scans .py files in its scripts directory as standalone scripts, so the
+internal implementation files deliberately use the .inc extension and are
+executed only from this entrypoint.
 """
 
 import os
 
 
 def _anomaly_script_dir():
+    """Return the real directory containing this loader on Windows/Linux."""
     try:
         if "__file__" in globals() and __file__:
             return os.path.dirname(os.path.abspath(__file__))
     except Exception:
         pass
+
+    # Fallback used by some PySpigot/Jython execution modes where __file__ is
+    # absent.  os.path.join keeps the path correct on Windows and Unix.
     cwd = os.getcwd()
     guess = os.path.join(cwd, "plugins", "PySpigot", "scripts")
-    if os.path.exists(guess):
-        return guess
-    return cwd
+    if os.path.isdir(guess):
+        return os.path.abspath(guess)
+    return os.path.abspath(cwd)
+
+
+def _exec_required(path, label):
+    if not os.path.isfile(path):
+        raise IOError("Missing {0}: {1}".format(label, path))
+    execfile(path, globals(), globals())
 
 
 _ANOMALY_SCRIPT_DIR = _anomaly_script_dir()
-_ANOMALY_CORE = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_core.py")
-_ANOMALY_INFECTION = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_infection.py")
+_ANOMALY_CORE = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_core.inc")
+_ANOMALY_INFECTION = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_infection.inc")
 
-# Jython 2.7 executes the original production script in this exact namespace,
-# so its manager, lifecycle, commands and JVM properties behave as they did in
-# for-cg.  No copy/reimplementation of the production logic is maintained here.
-execfile(_ANOMALY_CORE, globals(), globals())
+# Execute the exact production core in this script namespace.  This preserves
+# all existing manager/lifecycle/CoreProtect behaviour from for-cg.
+_exec_required(_ANOMALY_CORE, "anomaly core")
 
-# Infection is an additive event-phase extension.  If it ever fails to load,
-# keep the original anomaly system alive and leave a clear server-side error.
+# Infection is additive.  A failure here must not kill the already-started
+# production anomaly core; it is logged server-side instead.
 try:
-    execfile(_ANOMALY_INFECTION, globals(), globals())
+    _exec_required(_ANOMALY_INFECTION, "infection extension")
 except Exception as _infection_load_error:
     try:
         log_error(u"Fatal infection extension load error", _infection_load_error)

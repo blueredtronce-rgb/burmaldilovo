@@ -13,6 +13,9 @@ executed only from this entrypoint.
 """
 
 import os
+import math
+import random
+import time
 
 
 def _anomaly_script_dir():
@@ -54,12 +57,171 @@ except Exception as _infection_load_error:
             pass
 
 # ---------------------------------------------------------------------------
+# Infection tuning approved after test
+# ---------------------------------------------------------------------------
+try:
+    # 20% per exposure roll: first detection in an active zone, then every 5s.
+    INF_ZONE_CHANCE = 0.20
+
+    _base_infection_progress = AnomalyInfectionController._progress_and_symptoms
+
+    def _production_puke(self, player, minimum=None, maximum=None):
+        """Brewery visual looks best with 15-40 puke blocks."""
+        try:
+            amount = random.randint(15, 40)
+            Bukkit.dispatchCommand(
+                Bukkit.getConsoleSender(),
+                to_java_string(u"brew puke {0} {1}".format(player.getName(), amount))
+            )
+        except Exception as exc:
+            self.manager.log_error_throttled(
+                "infection-puke",
+                u"Brewery /brew puke integration failed",
+                exc,
+                120
+            )
+
+    def _production_global_pulses(self, players):
+        """Stage II-III pulse at every real-world :00 and :30; stage I is silent."""
+        try:
+            local = time.localtime()
+            minute = int(local.tm_min)
+        except Exception:
+            return
+        if minute not in (0, 30):
+            return
+        key = time.strftime("%Y%m%d%H%M", local)
+        if key == self.last_pulse_key:
+            return
+        self.last_pulse_key = key
+        for player in players:
+            record = self.record(player)
+            if record is None:
+                continue
+            stage = safe_int(record.get("stage"), 1, 1, 3)
+            if stage < 2:
+                continue
+            self._pulse(player, stage)
+
+    def _hallucination_delay(stage):
+        # Stage I: rare; stage II: noticeably more often; stage III: never
+        # more frequent than roughly once every 3-5 minutes.
+        if stage <= 1:
+            return random.randint(12 * 60, 18 * 60)
+        if stage == 2:
+            return random.randint(6 * 60, 9 * 60)
+        return random.randint(3 * 60, 5 * 60)
+
+    def _play_hallucination(self, player, stage):
+        """Play a fake nearby mob/explosion sound to this player only."""
+        try:
+            base = player.getLocation()
+            angle = random.random() * math.pi * 2.0
+            distance = random.uniform(4.0, 12.0)
+            sound_loc = base.clone().add(
+                math.cos(angle) * distance,
+                random.uniform(-1.0, 2.0),
+                math.sin(angle) * distance
+            )
+
+            roll = random.random()
+            if roll < 0.30:
+                names = ("ENTITY_CREEPER_PRIMED",)
+                volume = random.uniform(0.55, 0.85)
+                pitch = random.uniform(0.85, 1.08)
+            elif roll < 0.50:
+                names = ("ENTITY_TNT_PRIMED",)
+                volume = random.uniform(0.50, 0.80)
+                pitch = random.uniform(0.85, 1.10)
+            elif roll < 0.65:
+                names = ("ENTITY_GENERIC_EXPLODE",)
+                volume = random.uniform(0.40, 0.70)
+                pitch = random.uniform(0.90, 1.15)
+            else:
+                names = (
+                    "ENTITY_ZOMBIE_AMBIENT",
+                    "ENTITY_SKELETON_AMBIENT",
+                    "ENTITY_SPIDER_AMBIENT",
+                    "ENTITY_ENDERMAN_AMBIENT"
+                )
+                volume = random.uniform(0.45, 0.75)
+                pitch = random.uniform(0.85, 1.15)
+
+            sound = None
+            candidates = list(names)
+            random.shuffle(candidates)
+            for name in candidates:
+                sound = self._sound(name)
+                if sound is not None:
+                    break
+            if sound is None:
+                sound = self._sound("AMBIENT_CAVE")
+            if sound is None:
+                return
+
+            # Player#playSound sends the positional sound only to this player.
+            # No entity, TNT or explosion is spawned in the world.
+            player.playSound(sound_loc, sound, float(volume), float(pitch))
+        except Exception as exc:
+            self.manager.log_error_throttled(
+                "infection-hallucination",
+                u"Infection hallucination sound failed",
+                exc,
+                120
+            )
+
+    def _production_progress_and_symptoms(self, players, now):
+        _base_infection_progress(self, players, now)
+        if not hasattr(self, "hallucination_next"):
+            self.hallucination_next = {}
+
+        online = set()
+        for player in players:
+            try:
+                uid_key = self.uid(player)
+                online.add(uid_key)
+                record = self.record(player)
+                if record is None:
+                    self.hallucination_next.pop(uid_key, None)
+                    continue
+                stage = safe_int(record.get("stage"), 1, 1, 3)
+                due = safe_int(self.hallucination_next.get(uid_key), 0)
+                if due <= 0:
+                    self.hallucination_next[uid_key] = now + _hallucination_delay(stage)
+                    continue
+                if now < due:
+                    continue
+                _play_hallucination(self, player, stage)
+                self.hallucination_next[uid_key] = now + _hallucination_delay(stage)
+            except Exception as exc:
+                self.manager.log_error_throttled(
+                    "infection-hallucination-cycle",
+                    u"Infection hallucination cycle failed",
+                    exc,
+                    120
+                )
+
+        for uid_key in list(self.hallucination_next.keys()):
+            if uid_key not in online:
+                self.hallucination_next.pop(uid_key, None)
+
+    AnomalyInfectionController._puke = _production_puke
+    AnomalyInfectionController._global_pulses = _production_global_pulses
+    AnomalyInfectionController._progress_and_symptoms = _production_progress_and_symptoms
+
+    if infection_controller is not None:
+        infection_controller.hallucination_next = {}
+
+    log_action(u"Infection tuning installed: zone=20%, pulse=30m S2-S3, puke=15-40, hallucinations enabled.")
+except Exception as _infection_tuning_error:
+    try:
+        log_error(u"Cannot install infection tuning", _infection_tuning_error)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
 # Robust command bridge for Jython/PySpigot
 # ---------------------------------------------------------------------------
-# Some Jython/PySpigot builds keep the originally-bound manager method inside
-# the registered Command proxy.  Runtime replacement of manager.handle_command
-# can therefore be ignored.  Intercept the command at AnomalyCommand.execute
-# itself so /anomaly infection ... is routed before the production help path.
 try:
     _base_anomaly_execute = AnomalyCommand.execute
     _base_anomaly_tabcomplete = AnomalyCommand.tabComplete

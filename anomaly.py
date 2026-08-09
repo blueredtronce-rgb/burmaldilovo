@@ -1139,6 +1139,9 @@ class AnomalyManager(object):
             block = event.getBlock()
             location = block.getLocation()
             if self.anomaly_at_location(location) is not None:
+                # The entire active radius is a protected anomaly zone.  This
+                # prevents a replacement block from being mistaken for a
+                # player-owned block during later restoration.
                 event.setCancelled(True)
         except Exception as exc:
             self.log_error_throttled("block-protection", u"Block protection event failed", exc)
@@ -1151,6 +1154,8 @@ class AnomalyManager(object):
                     send_message(player, AnomalyConfig.PREFIX + message)
         except Exception as exc:
             self.log_error_throttled("notify-admins", u"Cannot notify online admins", exc)
+
+    # integrations ---------------------------------------------------------
 
     def get_town_state(self):
         if not JAVA_AVAILABLE or System is None:
@@ -1228,6 +1233,8 @@ class AnomalyManager(object):
             pass
         return None
 
+    # lookups --------------------------------------------------------------
+
     def non_closed_anomalies(self):
         result = []
         for anomaly in self.data.get("anomalies", {}).values():
@@ -1296,6 +1303,8 @@ class AnomalyManager(object):
             return None
         return max(candidates, key=lambda anomaly: safe_int(anomaly.get("created_at"), 0))
 
+    # active-zone effects --------------------------------------------------
+
     def on_bed_enter(self, event):
         try:
             player = event.getPlayer()
@@ -1306,6 +1315,9 @@ class AnomalyManager(object):
 
     def on_creature_spawn(self, event):
         try:
+            # Some Bukkit/Paper event subclasses share a HandlerList.  The
+            # executor can therefore receive ItemSpawnEvent or another sibling
+            # event even though it was registered for CreatureSpawnEvent.
             if not hasattr(event, "getSpawnReason"):
                 return
             try:
@@ -1387,6 +1399,7 @@ class AnomalyManager(object):
                 self.blindness_next.pop(uuid_key, None)
 
     def particle_cycle(self):
+        """Animate sparse smoke columns throughout each already-loaded anomaly."""
         if not self.active or Particle is None:
             return
         for anomaly in self.active_anomalies():
@@ -1399,6 +1412,8 @@ class AnomalyManager(object):
                 radius = max(3, safe_int(anomaly.get("radius"), AnomalyConfig.STAGE1_RADIUS))
                 phase = (now_ts() * AnomalyConfig.PARTICLE_RISE_BLOCKS_PER_SECOND)
                 for index in range(AnomalyConfig.PARTICLE_BURSTS_PER_CYCLE):
+                    # Uniform area distribution (sqrt) avoids a dense centre
+                    # and does not inspect or load any missing chunks.
                     distance = radius * math.sqrt(random.random()) * 0.95
                     angle = random.random() * math.pi * 2.0
                     x = int(round(float(anomaly.get("x")) + math.cos(angle) * distance))
@@ -1407,6 +1422,8 @@ class AnomalyManager(object):
                         continue
                     ground_y = int(world.getHighestBlockYAt(x, z)) + 1
                     rise = (phase + index * 7) % (AnomalyConfig.PARTICLE_MAX_HEIGHT + 1)
+                    # Each source advances upward by two blocks per second,
+                    # then restarts at the ground; zero spread prevents side drift.
                     world.spawnParticle(
                         Particle.CAMPFIRE_SIGNAL_SMOKE,
                         float(x) + 0.5, float(ground_y + rise), float(z) + 0.5,
@@ -1418,6 +1435,8 @@ class AnomalyManager(object):
                     u"Particle cycle failed for {0}".format(anomaly.get("id")), exc
                 )
                 continue
+
+    # world/candidate safety ----------------------------------------------
 
     def world_is_normal(self, world):
         if world is None:
@@ -1507,6 +1526,9 @@ class AnomalyManager(object):
                     wet += 1
                 if not is_natural_scene_material(mat):
                     artificial += 1
+        # Do not create an anomaly over rivers, oceans, lakes or lava.  A
+        # single wet sample is enough to reject a candidate so the protected
+        # radius does not overlap the shoreline and distort the lake bed.
         if wet > 0:
             return False
         allowed = max(
@@ -1526,7 +1548,10 @@ class AnomalyManager(object):
         return True
 
     def min_distance_from_anomalies_ok(self, world_name, x, z):
-        threshold = AnomalyConfig.ANOMALY_MIN_DISTANCE * AnomalyConfig.ANOMALY_MIN_DISTANCE
+        threshold = (
+                AnomalyConfig.ANOMALY_MIN_DISTANCE *
+                AnomalyConfig.ANOMALY_MIN_DISTANCE
+        )
         for anomaly in self.active_anomalies():
             if to_unicode(anomaly.get("world")) != to_unicode(world_name):
                 continue
@@ -1543,7 +1568,10 @@ class AnomalyManager(object):
         for anomaly in self.active_anomalies():
             if to_unicode(anomaly.get("world")) != to_unicode(home.get("world")):
                 continue
-            if dist_sq_2d(anomaly.get("x"), anomaly.get("z"), home.get("x"), home.get("z")) <= max_sq:
+            if dist_sq_2d(
+                    anomaly.get("x"), anomaly.get("z"),
+                    home.get("x"), home.get("z")
+            ) <= max_sq:
                 count += 1
         return count
 
@@ -1553,9 +1581,12 @@ class AnomalyManager(object):
     def validate_center(self, world, x, z, allow_near_town=False):
         if world is None or not self.world_is_normal(world):
             return False, u"только обычный мир"
-        if AnomalyConfig.MAX_ACTIVE > 0 and len(self.active_anomalies()) >= AnomalyConfig.MAX_ACTIVE:
+        if (AnomalyConfig.MAX_ACTIVE > 0 and
+                len(self.active_anomalies()) >= AnomalyConfig.MAX_ACTIVE):
             return False, u"достигнут глобальный лимит активных аномалий"
-        if not self.all_chunks_loaded_for_radius(world, x, z, AnomalyConfig.SAFETY_CONTAINER_RADIUS):
+        if not self.all_chunks_loaded_for_radius(
+                world, x, z, AnomalyConfig.SAFETY_CONTAINER_RADIUS
+        ):
             return False, u"не все проверяемые чанки загружены"
         world_name = to_unicode(world.getName())
         if not allow_near_town and not self.min_distance_from_towns_ok(world_name, x, z):
@@ -1599,6 +1630,8 @@ class AnomalyManager(object):
             return {"world": world, "x": x, "y": y, "z": z}, u"ok"
         return None, last_reason
 
+    # create/autospawn -----------------------------------------------------
+
     def allocate_id(self):
         next_id = max(1, safe_int(self.data.get("next_id"), 1))
         while True:
@@ -1613,22 +1646,37 @@ class AnomalyManager(object):
         anomaly_id = self.allocate_id()
         now = now_ts()
         anomaly = {
-            "id": anomaly_id, "status": "ACTIVE", "stage": 1,
+            "id": anomaly_id,
+            "status": "ACTIVE",
+            "stage": 1,
             "radius": AnomalyConfig.STAGE1_RADIUS,
             "world": to_unicode(world.getName()),
-            "x": int(point.get("x")), "y": int(point.get("y")), "z": int(point.get("z")),
-            "created_at": now, "stage_started_at": now,
+            "x": int(point.get("x")),
+            "y": int(point.get("y")),
+            "z": int(point.get("z")),
+            "created_at": now,
+            "stage_started_at": now,
             "source_type": to_unicode(source_type),
-            "source_player_uuid": None, "source_player_name": None,
-            "city_id": None, "city_name": None,
-            "reporter_uuid": None, "reporter_name": None,
-            "blocks": [], "player_touched_columns": {},
-            "stabilization_started_at": 0, "stabilization_total": 0, "fixed_at": 0,
+            "source_player_uuid": None,
+            "source_player_name": None,
+            "city_id": None,
+            "city_name": None,
+            "reporter_uuid": None,
+            "reporter_name": None,
+            "blocks": [],
+            "player_touched_columns": {},
+            "stabilization_started_at": 0,
+            "stabilization_total": 0,
+            "fixed_at": 0,
             "reward": {
                 "operation_id": "anomaly_reward_v1:{0}".format(anomaly_id),
-                "state": "NOT_READY", "amount": AnomalyConfig.REWARD_AMOUNT,
-                "prepared_at": 0, "before_balance": None, "expected_balance": None,
-                "paid_at": 0, "last_error": None
+                "state": "NOT_READY",
+                "amount": AnomalyConfig.REWARD_AMOUNT,
+                "prepared_at": 0,
+                "before_balance": None,
+                "expected_balance": None,
+                "paid_at": 0,
+                "last_error": None
             }
         }
         if source_player is not None:
@@ -1640,6 +1688,7 @@ class AnomalyManager(object):
         if city is not None:
             anomaly["city_id"] = to_unicode(city.get("id"))
             anomaly["city_name"] = to_unicode(city.get("name"))
+
         self.data.setdefault("anomalies", {})[anomaly_id] = anomaly
         if not self.storage.save(self.data):
             self.data.get("anomalies", {}).pop(anomaly_id, None)
@@ -1654,10 +1703,12 @@ class AnomalyManager(object):
         return anomaly
 
     def log_anomaly_creation(self, anomaly):
-        line = (u"id={0} source={1} city={2} player={3} world={4} x={5} y={6} z={7}").format(
-            anomaly.get("id"), anomaly.get("source_type"), anomaly.get("city_name") or "-",
-            anomaly.get("source_player_name") or "-", anomaly.get("world"), anomaly.get("x"),
-            anomaly.get("y"), anomaly.get("z")
+        """Append an audit line; the JSON journal remains the source of truth."""
+        line = (u"id={0} source={1} city={2} player={3} "
+                u"world={4} x={5} y={6} z={7}").format(
+            anomaly.get("id"), anomaly.get("source_type"),
+            anomaly.get("city_name") or "-", anomaly.get("source_player_name") or "-",
+            anomaly.get("world"), anomaly.get("x"), anomaly.get("y"), anomaly.get("z")
         )
         if not append_utf8_log(AnomalyConfig.SPAWN_LOG_FILE, "CREATE", line):
             log_error(u"Cannot append anomaly spawn log for {0}".format(anomaly.get("id")))
@@ -1666,12 +1717,17 @@ class AnomalyManager(object):
         try:
             loc = player.getLocation()
             world_name = to_unicode(loc.getWorld().getName())
-            threshold = AnomalyConfig.EXPLORER_MIN_FROM_TOWN * AnomalyConfig.EXPLORER_MIN_FROM_TOWN
+            threshold = (
+                    AnomalyConfig.EXPLORER_MIN_FROM_TOWN *
+                    AnomalyConfig.EXPLORER_MIN_FROM_TOWN
+            )
             for city in self.get_city_records():
                 home = self.city_home(city)
                 if home is None or to_unicode(home.get("world")) != world_name:
                     continue
-                if dist_sq_2d(loc.getX(), loc.getZ(), home.get("x"), home.get("z")) <= threshold:
+                if dist_sq_2d(
+                        loc.getX(), loc.getZ(), home.get("x"), home.get("z")
+                ) <= threshold:
                     return False
             return True
         except Exception:
@@ -1723,7 +1779,8 @@ class AnomalyManager(object):
         rotation["skip_city_id"] = None
         cities = self.get_city_records()
         cities.sort(key=lambda city: to_unicode(city.get("id") or city.get("name")).lower())
-        self.auto_note(u"старт проверки: городов={0}, пропускаемый город={1}".format(len(cities), skipped_city or u"-"))
+        self.auto_note(u"старт проверки: городов={0}, пропускаемый город={1}".format(
+            len(cities), skipped_city or u"-"))
         for city in cities:
             if not self.city_event_eligible(city):
                 self.auto_note(u"город {0}: пропуск (исключён, не настроен или не в обычном мире)".format(city.get("name")))
@@ -1737,9 +1794,11 @@ class AnomalyManager(object):
             if key == skipped_city:
                 self.auto_note(u"город {0}: пропущен по ротации".format(city.get("name")))
                 continue
-            point, reason = self.safe_point_around(world, home.get("x"), home.get("z"),
-                                                   AnomalyConfig.CITY_POINT_MIN, AnomalyConfig.CITY_POINT_MAX, 60,
-                                                   allow_near_town=True)
+            point, reason = self.safe_point_around(
+                world, home.get("x"), home.get("z"),
+                AnomalyConfig.CITY_POINT_MIN, AnomalyConfig.CITY_POINT_MAX, 60,
+                allow_near_town=True
+            )
             if point is None:
                 self.auto_note(u"город {0}: безопасная точка не найдена ({1})".format(city.get("name"), reason))
                 continue
@@ -1747,8 +1806,12 @@ class AnomalyManager(object):
             if anomaly is not None:
                 rotation["skip_city_id"] = key
                 self.storage.save(self.data)
+                log_info(u"Autospawned {0} near town {1}.".format(
+                    anomaly.get("id"), to_unicode(city.get("name"))
+                ))
                 self.auto_note(u"создана {0} у города {1}".format(anomaly.get("id"), city.get("name")))
                 return
+
         try:
             players = list(Bukkit.getOnlinePlayers())
         except Exception:
@@ -1756,25 +1819,34 @@ class AnomalyManager(object):
         players.sort(key=lambda player: str(player.getUniqueId()))
         skipped_player = to_unicode(rotation.get("skip_player_uuid"))
         rotation["skip_player_uuid"] = None
-        self.auto_note(u"переход к игрокам: онлайн={0}, пропускаемый UUID={1}".format(len(players), skipped_player or u"-"))
+        self.auto_note(u"переход к игрокам: онлайн={0}, пропускаемый UUID={1}".format(
+            len(players), skipped_player or u"-"))
         for player in players:
             try:
                 uuid_key = str(player.getUniqueId())
                 if uuid_key == skipped_player:
+                    self.auto_note(u"игрок {0}: пропущен по ротации".format(player.getName()))
                     continue
                 world = player.getWorld()
                 if not self.world_is_normal(world) or not self.player_far_from_all_towns(player):
+                    self.auto_note(u"игрок {0}: не подходит (мир или расстояние до города)".format(player.getName()))
                     continue
                 loc = player.getLocation()
-                point, reason = self.safe_point_around(world, loc.getX(), loc.getZ(),
-                                                       AnomalyConfig.EXPLORER_POINT_MIN,
-                                                       AnomalyConfig.EXPLORER_POINT_MAX, 18)
+                point, reason = self.safe_point_around(
+                    world, loc.getX(), loc.getZ(),
+                    AnomalyConfig.EXPLORER_POINT_MIN,
+                    AnomalyConfig.EXPLORER_POINT_MAX, 18
+                )
                 if point is None:
+                    self.auto_note(u"игрок {0}: безопасная точка не найдена ({1})".format(player.getName(), reason))
                     continue
                 anomaly = self.create_anomaly(point, "EXPLORER", source_player=player)
                 if anomaly is not None:
                     rotation["skip_player_uuid"] = uuid_key
                     self.storage.save(self.data)
+                    log_info(u"Autospawned {0} around explorer {1}.".format(
+                        anomaly.get("id"), to_unicode(player.getName())
+                    ))
                     self.auto_note(u"создана {0} у игрока {1}".format(anomaly.get("id"), player.getName()))
                     return
             except Exception:
@@ -1794,9 +1866,11 @@ class AnomalyManager(object):
         world = Bukkit.getWorld(to_java_string(home.get("world")))
         if world is None or not self.world_is_normal(world):
             return None, u"home города не в обычном мире"
-        point, reason = self.safe_point_around(world, home.get("x"), home.get("z"),
-                                               AnomalyConfig.CITY_POINT_MIN,
-                                               AnomalyConfig.CITY_POINT_MAX, 40)
+        point, reason = self.safe_point_around(
+            world, home.get("x"), home.get("z"),
+            AnomalyConfig.CITY_POINT_MIN,
+            AnomalyConfig.CITY_POINT_MAX, 40
+        )
         if point is None:
             return None, reason
         anomaly = self.create_anomaly(point, "ADMIN_CITY", city=city)
@@ -1815,20 +1889,33 @@ class AnomalyManager(object):
         ok, reason = self.validate_center(world, x, z)
         if not ok:
             return None, reason
-        point = {"world": world, "x": x, "y": int(world.getHighestBlockYAt(x, z)) + 1, "z": z}
+        point = {
+            "world": world,
+            "x": x,
+            "y": int(world.getHighestBlockYAt(x, z)) + 1,
+            "z": z
+        }
         anomaly = self.create_anomaly(point, "ADMIN_HERE")
         if anomaly is None:
             return None, u"не удалось сохранить новую аномалию"
         return anomaly, u"ok"
 
+    # terrain distortion ---------------------------------------------------
+
     def block_key(self, world_name, x, y, z):
-        return "{0}:{1}:{2}:{3}".format(to_unicode(world_name), int(x), int(y), int(z))
+        return "{0}:{1}:{2}:{3}".format(
+            to_unicode(world_name), int(x), int(y), int(z)
+        )
 
     def existing_block_keys(self, anomaly):
         result = set()
         for record in anomaly.get("blocks", []):
-            if isinstance(record, dict):
-                result.add(self.block_key(record.get("world"), record.get("x"), record.get("y"), record.get("z")))
+            if not isinstance(record, dict):
+                continue
+            result.add(self.block_key(
+                record.get("world"), record.get("x"),
+                record.get("y"), record.get("z")
+            ))
         return result
 
     def serialize_block(self, block):
@@ -1891,13 +1978,22 @@ class AnomalyManager(object):
         stage = safe_int(anomaly.get("stage"), 1)
         applied_surface = self.surface_count(anomaly)
         if stage <= 1:
-            min_radius, max_radius = 0.0, float(AnomalyConfig.STAGE1_RADIUS)
+            min_radius = 0.0
+            max_radius = float(AnomalyConfig.STAGE1_RADIUS)
         elif applied_surface < AnomalyConfig.STAGE1_SURFACE_TARGET:
-            min_radius, max_radius = 0.0, float(AnomalyConfig.STAGE1_RADIUS)
+            min_radius = 0.0
+            max_radius = float(AnomalyConfig.STAGE1_RADIUS)
         else:
-            min_radius, max_radius = float(AnomalyConfig.STAGE1_RADIUS) + 0.5, float(AnomalyConfig.STAGE2_RADIUS)
+            min_radius = float(AnomalyConfig.STAGE1_RADIUS) + 0.5
+            max_radius = float(AnomalyConfig.STAGE2_RADIUS)
+
+        # A dense or awkward biome can reject many random columns.  Keep the
+        # distortion progressing instead of treating a short unlucky streak as
+        # the end of the anomaly.
         for unused in range(160):
-            x, z = self.random_point(anomaly.get("x"), anomaly.get("z"), min_radius, max_radius)
+            x, z = self.random_point(
+                anomaly.get("x"), anomaly.get("z"), min_radius, max_radius
+            )
             if not self.chunk_loaded(world, x, z):
                 continue
             touched_key = "{0}:{1}".format(int(x), int(z))
@@ -1906,7 +2002,9 @@ class AnomalyManager(object):
             ground = self.find_natural_ground(world, x, z)
             if ground is None:
                 continue
-            key = self.block_key(anomaly.get("world"), ground.getX(), ground.getY(), ground.getZ())
+            key = self.block_key(
+                anomaly.get("world"), ground.getX(), ground.getY(), ground.getZ()
+            )
             if key in existing_keys:
                 continue
             new_material = self.pick_distortion_material()
@@ -1917,21 +2015,40 @@ class AnomalyManager(object):
             if original == anomaly_data:
                 continue
             record = {
-                "world": to_unicode(anomaly.get("world")), "x": int(ground.getX()),
-                "y": int(ground.getY()), "z": int(ground.getZ()), "kind": "surface",
-                "stage": stage, "original_data": original, "anomaly_data": anomaly_data,
-                "state": "PLANNED", "planned_at": now_ts()
+                "world": to_unicode(anomaly.get("world")),
+                "x": int(ground.getX()),
+                "y": int(ground.getY()),
+                "z": int(ground.getZ()),
+                "kind": "surface",
+                "stage": stage,
+                "original_data": original,
+                "anomaly_data": anomaly_data,
+                "state": "PLANNED",
+                "planned_at": now_ts()
             }
             vein = None
             if random.random() < AnomalyConfig.VEIN_CHANCE:
-                above = world.getBlockAt(int(ground.getX()), int(ground.getY()) + 1, int(ground.getZ()))
-                above_key = self.block_key(anomaly.get("world"), above.getX(), above.getY(), above.getZ())
-                if above_key not in existing_keys and material_name(above.getType()) in ("AIR", "CAVE_AIR"):
+                above = world.getBlockAt(
+                    int(ground.getX()), int(ground.getY()) + 1, int(ground.getZ())
+                )
+                above_key = self.block_key(
+                    anomaly.get("world"),
+                    above.getX(), above.getY(), above.getZ()
+                )
+                if (
+                        above_key not in existing_keys and
+                        material_name(above.getType()) in ("AIR", "CAVE_AIR")
+                ):
                     vein = {
-                        "world": to_unicode(anomaly.get("world")), "x": int(above.getX()),
-                        "y": int(above.getY()), "z": int(above.getZ()), "kind": "vein",
-                        "stage": stage, "original_data": self.serialize_block(above),
-                        "anomaly_data": self.make_vein_data_string(), "state": "PLANNED",
+                        "world": to_unicode(anomaly.get("world")),
+                        "x": int(above.getX()),
+                        "y": int(above.getY()),
+                        "z": int(above.getZ()),
+                        "kind": "vein",
+                        "stage": stage,
+                        "original_data": self.serialize_block(above),
+                        "anomaly_data": self.make_vein_data_string(),
+                        "state": "PLANNED",
                         "planned_at": now_ts()
                     }
             return record, vein
@@ -1941,7 +2058,9 @@ class AnomalyManager(object):
         world = Bukkit.getWorld(to_java_string(record.get("world")))
         if world is None:
             return False
-        x, y, z = int(record.get("x")), int(record.get("y")), int(record.get("z"))
+        x = int(record.get("x"))
+        y = int(record.get("y"))
+        z = int(record.get("z"))
         if not self.chunk_loaded(world, x, z):
             return False
         block = world.getBlockAt(x, y, z)
@@ -1956,9 +2075,11 @@ class AnomalyManager(object):
             return False
         try:
             data = Bukkit.createBlockData(to_java_string(anomaly_data))
-            if not self.coreprotect_log_transition(block, original, anomaly_data,
-                                                   AnomalyConfig.COREPROTECT_APPLY_ACTOR, record, "apply"):
+            if not self.coreprotect_log_transition(
+                    block, original, anomaly_data,
+                    AnomalyConfig.COREPROTECT_APPLY_ACTOR, record, "apply"):
                 record["state"] = "COREPROTECT_FAILED"
+                record["last_error"] = u"CoreProtect did not confirm both journal records"
                 return False
             block.setBlockData(data, False)
             record["state"] = "APPLIED"
@@ -1967,23 +2088,64 @@ class AnomalyManager(object):
         except Exception as exc:
             record["state"] = "APPLY_FAILED"
             record["last_error"] = to_unicode(exc)
-            log_error(u"Cannot apply anomaly block at {0}:{1},{2},{3}".format(record.get("world"), x, y, z), exc)
+            log_error(u"Cannot apply anomaly block at {0}:{1},{2},{3}".format(
+                record.get("world"), x, y, z
+            ), exc)
             return False
 
     def surface_count(self, anomaly):
-        return len([r for r in anomaly.get("blocks", []) if isinstance(r, dict) and r.get("kind") == "surface" and r.get("state") in ("APPLIED", "PLANNED")])
+        count = 0
+        for record in anomaly.get("blocks", []):
+            if (
+                    isinstance(record, dict) and
+                    record.get("kind") == "surface" and
+                    record.get("state") in ("APPLIED", "PLANNED")
+            ):
+                count += 1
+        return count
+
+    def desired_surface_count(self, anomaly):
+        stage = safe_int(anomaly.get("stage"), 1)
+        elapsed = max(0, now_ts() - safe_int(
+            anomaly.get("stage_started_at"),
+            anomaly.get("created_at", now_ts())
+        ))
+        fraction = min(1.0, float(elapsed) / float(AnomalyConfig.STAGE_SECONDS))
+        if stage <= 1:
+            return min(
+                AnomalyConfig.STAGE1_SURFACE_TARGET,
+                max(1, int(math.floor(
+                    AnomalyConfig.STAGE1_SURFACE_TARGET * fraction
+                )) + 1)
+            )
+        return min(
+            AnomalyConfig.STAGE2_SURFACE_TARGET_TOTAL,
+            AnomalyConfig.STAGE1_SURFACE_TARGET +
+            int(math.floor(
+                AnomalyConfig.STAGE2_ADDITIONAL_TARGET * fraction
+            ))
+        )
 
     def distortion_cycle(self):
-        if not self.active or not self.coreprotect_ready_for_mutation("distortion_cycle"):
+        if not self.active:
+            return
+        if not self.coreprotect_ready_for_mutation("distortion_cycle"):
             return
         changed_any = False
         for anomaly in list(self.active_anomalies()):
             if anomaly.get("status") != "ACTIVE":
                 continue
-            target = AnomalyConfig.STAGE1_SURFACE_TARGET if safe_int(anomaly.get("stage"), 1) <= 1 else AnomalyConfig.STAGE2_SURFACE_TARGET_TOTAL
+            stage = safe_int(anomaly.get("stage"), 1)
+            if stage <= 1:
+                target = AnomalyConfig.STAGE1_SURFACE_TARGET
+            else:
+                target = AnomalyConfig.STAGE2_SURFACE_TARGET_TOTAL
             current = self.surface_count(anomaly)
             if current >= target:
                 continue
+            # Add at most one surface block every timer run.  Do not use the
+            # elapsed-stage calculation here: it initially evaluates to one,
+            # which used to stop all subsequent distortions for 96 hours.
             remaining = min(AnomalyConfig.DISTORTION_MAX_PER_CYCLE, target - current)
             existing_keys = self.existing_block_keys(anomaly)
             planned = []
@@ -1992,20 +2154,32 @@ class AnomalyManager(object):
                 if surface is None:
                     break
                 planned.append(surface)
-                existing_keys.add(self.block_key(surface.get("world"), surface.get("x"), surface.get("y"), surface.get("z")))
+                existing_keys.add(self.block_key(
+                    surface.get("world"), surface.get("x"),
+                    surface.get("y"), surface.get("z")
+                ))
                 if vein is not None:
                     planned.append(vein)
-                    existing_keys.add(self.block_key(vein.get("world"), vein.get("x"), vein.get("y"), vein.get("z")))
+                    existing_keys.add(self.block_key(
+                        vein.get("world"), vein.get("x"),
+                        vein.get("y"), vein.get("z")
+                    ))
             if not planned:
                 continue
+
             anomaly.setdefault("blocks", []).extend(planned)
             if not self.storage.save(self.data):
                 del anomaly["blocks"][-len(planned):]
+                log_info(u"Skipped distortion for {0}: journal save failed.".format(
+                    anomaly.get("id")
+                ))
                 continue
+
             for record in planned:
                 self.apply_planned_record(record)
             self.dirty = True
             changed_any = True
+
         if changed_any:
             self.flush_dirty(force=False)
 
@@ -2015,15 +2189,20 @@ class AnomalyManager(object):
             if not isinstance(anomaly, dict):
                 continue
             for record in anomaly.get("blocks", []):
-                if not isinstance(record, dict) or record.get("state") not in ("PLANNED", "APPLY_FAILED"):
+                if not isinstance(record, dict):
+                    continue
+                if record.get("state") not in ("PLANNED", "APPLY_FAILED"):
                     continue
                 world = Bukkit.getWorld(to_java_string(record.get("world")))
                 if world is None:
                     continue
-                x, y, z = int(record.get("x")), int(record.get("y")), int(record.get("z"))
+                x = int(record.get("x"))
+                y = int(record.get("y"))
+                z = int(record.get("z"))
                 if not self.chunk_loaded(world, x, z):
                     continue
-                current = self.serialize_block(world.getBlockAt(x, y, z))
+                block = world.getBlockAt(x, y, z)
+                current = self.serialize_block(block)
                 if current == to_unicode(record.get("anomaly_data")):
                     record["state"] = "APPLIED"
                     changed = True
@@ -2039,6 +2218,8 @@ class AnomalyManager(object):
         if changed:
             self.storage.save(self.data)
 
+    # stage progression ----------------------------------------------------
+
     def stage_name(self, stage):
         return u"Подозрение" if safe_int(stage, 1) <= 1 else u"Усиление"
 
@@ -2048,30 +2229,49 @@ class AnomalyManager(object):
         now = now_ts()
         changed = False
         for anomaly in self.active_anomalies():
-            if anomaly.get("status") != "ACTIVE" or safe_int(anomaly.get("stage"), 1) != 1:
+            if anomaly.get("status") != "ACTIVE":
                 continue
-            started = safe_int(anomaly.get("stage_started_at"), anomaly.get("created_at", now))
+            stage = safe_int(anomaly.get("stage"), 1)
+            if stage != 1:
+                continue
+            started = safe_int(
+                anomaly.get("stage_started_at"),
+                anomaly.get("created_at", now)
+            )
             if now - started < AnomalyConfig.STAGE_SECONDS:
                 continue
             anomaly["stage"] = 2
             anomaly["radius"] = AnomalyConfig.STAGE2_RADIUS
             anomaly["stage_started_at"] = now
             changed = True
-            self.notify_admins(u"&dАномалия &f{0}&d перешла на стадию 2 «Усиление».".format(anomaly.get("id")))
+            self.notify_admins(
+                u"&dАномалия &f{0}&d перешла на стадию 2 «Усиление». "
+                u"&7Центр: {1} [{2}, {3}], радиус ~{4}."
+                .format(
+                    anomaly.get("id"), anomaly.get("world"),
+                    anomaly.get("x"), anomaly.get("z"),
+                    AnomalyConfig.STAGE2_RADIUS
+                )
+            )
         if changed:
             self.storage.save(self.data)
 
     def manual_next_stage(self, anomaly):
         if anomaly.get("status") != "ACTIVE":
             return False, u"аномалия не активна"
-        if safe_int(anomaly.get("stage"), 1) >= 2:
+        stage = safe_int(anomaly.get("stage"), 1)
+        if stage >= 2:
             return False, u"стадии 3 и 4 пока не реализованы"
         anomaly["stage"] = 2
         anomaly["radius"] = AnomalyConfig.STAGE2_RADIUS
         anomaly["stage_started_at"] = now_ts()
         if not self.storage.save(self.data):
+            anomaly["stage"] = 1
+            anomaly["radius"] = AnomalyConfig.STAGE1_RADIUS
             return False, u"не удалось сохранить переход стадии"
         return True, u"стадия 2 включена"
+
+    # stabilization --------------------------------------------------------
 
     def create_bossbar(self, anomaly):
         anomaly_id = anomaly.get("id")
@@ -2079,11 +2279,15 @@ class AnomalyManager(object):
         if old is not None:
             return old
         try:
-            bar = Bukkit.createBossBar(to_java_string(u"Стабилизация {0}".format(anomaly_id)), BarColor.PURPLE, BarStyle.SOLID)
+            bar = Bukkit.createBossBar(
+                to_java_string(u"Стабилизация {0}".format(anomaly_id)),
+                BarColor.PURPLE, BarStyle.SOLID
+            )
             bar.setProgress(0.0)
             self.bossbars[anomaly_id] = bar
             return bar
-        except Exception:
+        except Exception as exc:
+            log_error(u"Cannot create boss bar for {0}".format(anomaly_id), exc)
             return None
 
     def remove_bossbar(self, anomaly_id):
@@ -2103,6 +2307,9 @@ class AnomalyManager(object):
             return
         try:
             current = set([str(p.getUniqueId()) for p in bar.getPlayers()])
+        except Exception:
+            current = set()
+        try:
             for player in Bukkit.getOnlinePlayers():
                 if self.is_admin(player):
                     if str(player.getUniqueId()) not in current:
@@ -2118,33 +2325,66 @@ class AnomalyManager(object):
     def resume_bossbars(self):
         for anomaly in self.active_anomalies():
             if anomaly.get("status") == "STABILIZING":
-                self.bossbar_add_admins(self.create_bossbar(anomaly))
+                bar = self.create_bossbar(anomaly)
+                self.bossbar_add_admins(bar)
 
     def start_stabilization(self, anomaly):
+        if anomaly.get("status") == "FIXED":
+            return False, u"аномалия уже закрыта"
+        if anomaly.get("status") == "STABILIZING":
+            return False, u"стабилизация уже идёт"
         if anomaly.get("status") != "ACTIVE":
             return False, u"аномалия не активна"
+        old_status = anomaly.get("status")
         anomaly["status"] = "STABILIZING"
         anomaly["stabilization_started_at"] = now_ts()
         anomaly["stabilization_total"] = len(anomaly.get("blocks", []))
         if not self.storage.save(self.data):
-            anomaly["status"] = "ACTIVE"
+            anomaly["status"] = old_status
+            log_error(u"Cannot start stabilization for {0}: journal save failed".format(
+                anomaly.get("id")
+            ))
             return False, u"не удалось сохранить начало стабилизации"
-        self.bossbar_add_admins(self.create_bossbar(anomaly))
+        log_action(u"Stabilization started for {0}; blocks={1}; admin_cleanup={2}".format(
+            anomaly.get("id"), len(anomaly.get("blocks", [])),
+            bool(anomaly.get("admin_cleanup"))
+        ))
+        bar = self.create_bossbar(anomaly)
+        self.bossbar_add_admins(bar)
         if not anomaly.get("blocks"):
             self.finish_stabilization(anomaly)
         return True, u"стабилизация запущена"
 
     def start_quiet_removal(self, anomaly):
-        if anomaly is None or anomaly.get("status") not in ("ACTIVE", "STABILIZING"):
+        """Immediately hide a zone, then restore it without teleporting or loading chunks."""
+        if anomaly is None:
+            return False, u"аномалия не найдена"
+        old_status = anomaly.get("status")
+        if old_status == "FIXED":
+            return False, u"аномалия уже закрыта"
+        if old_status == "REMOVING":
+            return False, u"тихое удаление уже выполняется"
+        if old_status not in ("ACTIVE", "STABILIZING"):
             return False, u"аномалия не находится в удаляемом состоянии"
+        old_admin_cleanup = anomaly.get("admin_cleanup")
+        old_quiet_removal = anomaly.get("quiet_removal")
         anomaly["status"] = "REMOVING"
         anomaly["admin_cleanup"] = True
         anomaly["quiet_removal"] = True
         anomaly["stabilization_started_at"] = now_ts()
         anomaly["stabilization_total"] = len(anomaly.get("blocks", []))
         if not self.storage.save(self.data):
+            anomaly["status"] = old_status
+            anomaly["admin_cleanup"] = old_admin_cleanup
+            anomaly["quiet_removal"] = old_quiet_removal
+            log_error(u"Cannot start quiet removal for {0}: journal save failed".format(
+                anomaly.get("id")
+            ))
             return False, u"не удалось сохранить тихое удаление"
         self.remove_bossbar(anomaly.get("id"))
+        log_action(u"Quiet removal started for {0}; blocks={1}".format(
+            anomaly.get("id"), len(anomaly.get("blocks", []))
+        ))
         if not anomaly.get("blocks"):
             self.finish_stabilization(anomaly)
         return True, u"аномалия скрыта; блоки восстанавливаются в загруженных чанках"
@@ -2153,13 +2393,18 @@ class AnomalyManager(object):
         return record.get("state") in ("RESTORED", "SKIPPED_PLAYER")
 
     def unresolved_records(self, anomaly):
-        return [r for r in anomaly.get("blocks", []) if isinstance(r, dict) and not self.record_resolved(r)]
+        return [
+            record for record in anomaly.get("blocks", [])
+            if isinstance(record, dict) and not self.record_resolved(record)
+        ]
 
     def restore_record(self, record):
         world = Bukkit.getWorld(to_java_string(record.get("world")))
         if world is None:
             return False
-        x, y, z = int(record.get("x")), int(record.get("y")), int(record.get("z"))
+        x = int(record.get("x"))
+        y = int(record.get("y"))
+        z = int(record.get("z"))
         if not self.chunk_loaded(world, x, z):
             return False
         block = world.getBlockAt(x, y, z)
@@ -2168,52 +2413,92 @@ class AnomalyManager(object):
         anomaly_data = to_unicode(record.get("anomaly_data"))
         if current == original:
             record["state"] = "RESTORED"
+            record["restored_at"] = now_ts()
             return True
         if current != anomaly_data:
             record["state"] = "SKIPPED_PLAYER"
+            record["restored_at"] = now_ts()
+            log_error(u"Restoration skipped because block was externally changed at {0}:{1},{2},{3}".format(
+                record.get("world"), x, y, z
+            ))
             return True
         try:
             data = Bukkit.createBlockData(to_java_string(original))
-            if not self.coreprotect_log_transition(block, anomaly_data, original,
-                                                   AnomalyConfig.COREPROTECT_RESTORE_ACTOR, record, "restore"):
+            if not self.coreprotect_log_transition(
+                    block, anomaly_data, original,
+                    AnomalyConfig.COREPROTECT_RESTORE_ACTOR, record, "restore"):
+                record["state"] = "COREPROTECT_RESTORE_FAILED"
+                record["last_error"] = u"CoreProtect did not confirm restoration journal records"
                 return False
             block.setBlockData(data, False)
             record["state"] = "RESTORED"
             record["restored_at"] = now_ts()
             return True
-        except Exception:
+        except Exception as exc:
+            record["state"] = "RESTORE_FAILED"
+            record["last_error"] = to_unicode(exc)
+            log_error(u"Cannot restore anomaly block at {0}:{1},{2},{3}".format(
+                record.get("world"), x, y, z
+            ), exc)
             return False
 
     def stabilization_cycle(self):
-        if not self.active or not self.coreprotect_ready_for_mutation("stabilization_cycle"):
+        if not self.active:
+            return
+        if not self.coreprotect_ready_for_mutation("stabilization_cycle"):
             return
         changed = False
         for anomaly in list(self.data.get("anomalies", {}).values()):
-            if not isinstance(anomaly, dict) or anomaly.get("status") not in ("STABILIZING", "REMOVING"):
+            if not isinstance(anomaly, dict):
+                continue
+            if anomaly.get("status") not in ("STABILIZING", "REMOVING"):
                 continue
             unresolved = self.unresolved_records(anomaly)
-            total = max(1, safe_int(anomaly.get("stabilization_total"), len(anomaly.get("blocks", []))))
+            total = max(
+                1,
+                safe_int(anomaly.get("stabilization_total"),
+                         len(anomaly.get("blocks", [])))
+            )
             if not unresolved:
                 self.finish_stabilization(anomaly)
                 continue
-            cycles = max(1, int((AnomalyConfig.STABILIZE_SECONDS * 20) / AnomalyConfig.STABILIZE_TICKS))
+            cycles = max(
+                1,
+                int((AnomalyConfig.STABILIZE_SECONDS * 20) /
+                    AnomalyConfig.STABILIZE_TICKS)
+            )
             budget = max(1, int(math.ceil(float(total) / float(cycles))))
-            for record in unresolved[:budget]:
+            processed = 0
+            for record in unresolved:
+                if processed >= budget:
+                    break
+                processed += 1
                 if self.restore_record(record):
                     changed = True
-            resolved_count = len([r for r in anomaly.get("blocks", []) if isinstance(r, dict) and self.record_resolved(r)])
+
+            resolved_count = len([
+                record for record in anomaly.get("blocks", [])
+                if isinstance(record, dict) and self.record_resolved(record)
+            ])
             progress = min(1.0, max(0.0, float(resolved_count) / float(total)))
+            bar = None
             if anomaly.get("status") == "STABILIZING":
                 bar = self.create_bossbar(anomaly)
-                if bar is not None:
-                    try:
-                        bar.setProgress(progress)
-                        bar.setTitle(to_java_string(u"Стабилизация {0}: {1}%".format(anomaly.get("id"), int(progress * 100))))
-                    except Exception:
-                        pass
-                    self.bossbar_add_admins(bar)
+            if bar is not None:
+                try:
+                    bar.setProgress(progress)
+                    bar.setTitle(to_java_string(
+                        u"Стабилизация {0}: {1}%".format(
+                            anomaly.get("id"), int(progress * 100.0)
+                        )
+                    ))
+                except Exception:
+                    pass
+                self.bossbar_add_admins(bar)
+
             if not self.unresolved_records(anomaly):
                 self.finish_stabilization(anomaly)
+
         if changed:
             self.dirty = True
             self.flush_dirty(force=False)
@@ -2221,20 +2506,42 @@ class AnomalyManager(object):
     def finish_stabilization(self, anomaly):
         if self.unresolved_records(anomaly):
             return False
+        previous_status = anomaly.get("status")
         anomaly["status"] = "FIXED"
         anomaly["fixed_at"] = now_ts()
         if anomaly.get("admin_cleanup"):
-            anomaly.setdefault("reward", {})["state"] = "CANCELLED_ADMIN"
+            reward = anomaly.setdefault("reward", {})
+            reward["state"] = "CANCELLED_ADMIN"
+            reward["last_error"] = u"закрыто административной очисткой"
+        anomaly_id = anomaly.get("id")
         if not self.storage.save(self.data):
+            anomaly["status"] = previous_status
+            anomaly["fixed_at"] = 0
+            log_error(u"Cannot finish stabilization for {0}: journal save failed".format(
+                anomaly_id
+            ))
             return False
-        self.remove_bossbar(anomaly.get("id"))
-        if not anomaly.get("admin_cleanup"):
-            self.issue_reward(anomaly)
-        return True
+        self.remove_bossbar(anomaly_id)
+        if anomaly.get("admin_cleanup"):
+            ok, message = True, u"административная очистка, награда не выдана"
+        else:
+            ok, message = self.issue_reward(anomaly)
+        self.notify_admins(
+            u"&aАномалия &f{0}&a стабилизирована. &7Награда: {1}"
+            .format(anomaly_id, message)
+        )
+        log_action(u"Stabilization completed for {0}; reward={1}".format(
+            anomaly_id, message
+        ))
+        return ok
+
+    # reward journal -------------------------------------------------------
 
     def reward_close_enough(self, left, right):
+        if left is None or right is None:
+            return False
         try:
-            return left is not None and right is not None and abs(float(left) - float(right)) < 0.005
+            return abs(float(left) - float(right)) < 0.005
         except Exception:
             return False
 
@@ -2242,73 +2549,224 @@ class AnomalyManager(object):
         reward = anomaly.setdefault("reward", {})
         reward.setdefault("operation_id", "anomaly_reward_v1:{0}".format(anomaly.get("id")))
         reward.setdefault("amount", AnomalyConfig.REWARD_AMOUNT)
-        if reward.get("state") == "PAID":
+        state = to_unicode(reward.get("state") or "NOT_READY")
+
+        if state == "PAID":
             return True, u"уже выплачена"
         reporter_uuid = anomaly.get("reporter_uuid")
         if not reporter_uuid:
             reward["state"] = "NO_REPORTER"
+            reward["last_error"] = u"репортёр не назначен"
             self.storage.save(self.data)
             return False, u"репортёр не назначен"
+
         economy = self.get_economy_manager()
         if economy is None:
             reward["state"] = "FAILED"
+            reward["last_error"] = u"экономика недоступна"
             self.storage.save(self.data)
             return False, u"экономика недоступна"
+
         try:
             current = float(economy.get_balance(str(reporter_uuid)))
-            amount = safe_float(reward.get("amount"), AnomalyConfig.REWARD_AMOUNT, 0.01)
+        except Exception as exc:
+            reward["state"] = "FAILED"
+            reward["last_error"] = u"не удалось прочитать баланс: {0}".format(exc)
+            log_error(u"Cannot read reward balance for anomaly {0}".format(anomaly.get("id")), exc)
+            self.storage.save(self.data)
+            return False, reward["last_error"]
+
+        before = reward.get("before_balance")
+        expected = reward.get("expected_balance")
+
+        if state == "PREPARED":
+            if before is None or expected is None:
+                reward["state"] = "REVIEW_REQUIRED"
+                reward["last_error"] = u"PREPARED-операция не содержит полного балансового журнала"
+                self.storage.save(self.data)
+                return False, u"нужна ручная проверка экономики"
+            if self.reward_close_enough(current, expected):
+                reward["state"] = "PAID"
+                reward["paid_at"] = now_ts()
+                reward["last_error"] = None
+                self.storage.save(self.data)
+                return True, u"подтверждена после восстановления"
+            if before is not None and not self.reward_close_enough(current, before):
+                reward["state"] = "REVIEW_REQUIRED"
+                reward["last_error"] = (
+                    u"неоднозначное состояние выплаты: ожидалось {0} или {1}, сейчас {2}"
+                    .format(before, expected, current)
+                )
+                self.storage.save(self.data)
+                return False, u"нужна ручная проверка экономики"
+
+        if state == "REVIEW_REQUIRED":
+            return False, u"нужна ручная проверка экономики"
+
+        if state != "PREPARED":
+            amount = safe_float(
+                reward.get("amount"), AnomalyConfig.REWARD_AMOUNT, 0.01
+            )
             before = current
             expected = round(before + amount, 2)
             reward["state"] = "PREPARED"
+            reward["prepared_at"] = now_ts()
             reward["before_balance"] = before
             reward["expected_balance"] = expected
-            self.storage.save(self.data)
-            success, new_balance = economy.deposit_checked(str(reporter_uuid), amount, None)
-            if not success or not self.reward_close_enough(new_balance, expected):
-                reward["state"] = "REVIEW_REQUIRED"
-                self.storage.save(self.data)
-                return False, u"начисление требует ручной проверки"
-            reward["state"] = "PAID"
-            reward["paid_at"] = now_ts()
-            self.storage.save(self.data)
-            return True, u"5000$ выплачено"
+            reward["last_error"] = None
+            if not self.storage.save(self.data):
+                reward["state"] = "FAILED"
+                reward["last_error"] = u"не удалось сохранить подготовленную операцию"
+                return False, reward["last_error"]
+
+        try:
+            success, new_balance = economy.deposit_checked(
+                str(reporter_uuid),
+                float(reward.get("amount", AnomalyConfig.REWARD_AMOUNT)),
+                None
+            )
         except Exception as exc:
             reward["state"] = "PREPARED"
-            reward["last_error"] = to_unicode(exc)
+            reward["last_error"] = u"неоднозначная ошибка экономики: {0}".format(exc)
+            log_error(u"Ambiguous economy error for anomaly {0}".format(anomaly.get("id")), exc)
             self.storage.save(self.data)
             return False, u"выплата оставлена на безопасном восстановлении"
 
+        if not success:
+            reward["state"] = "FAILED"
+            reward["last_error"] = u"экономика отклонила начисление"
+            self.storage.save(self.data)
+            return False, reward["last_error"]
+
+        if not self.reward_close_enough(new_balance, expected):
+            reward["state"] = "REVIEW_REQUIRED"
+            reward["last_error"] = (
+                u"экономика вернула неожиданный баланс {0}, ожидалось {1}"
+                .format(new_balance, expected)
+            )
+            self.storage.save(self.data)
+            return False, u"начисление требует ручной проверки"
+
+        reward["state"] = "PAID"
+        reward["paid_at"] = now_ts()
+        reward["last_error"] = None
+        if not self.storage.save(self.data):
+            reward["state"] = "PREPARED"
+            return False, u"выплачено; подтверждение будет восстановлено по журналу"
+
+        log_info(u"Reward {0}$ for {1} paid to UUID {2}; operation {3}."
+        .format(
+            reward.get("amount"), anomaly.get("id"),
+            reporter_uuid, reward.get("operation_id")
+        ))
+        return True, u"5000$ выплачено"
+
     def recover_prepared_rewards(self):
         for anomaly in self.data.get("anomalies", {}).values():
-            if isinstance(anomaly, dict) and anomaly.get("status") == "FIXED":
-                reward = anomaly.get("reward", {})
-                if isinstance(reward, dict) and reward.get("state") == "PREPARED":
-                    self.issue_reward(anomaly)
+            if not isinstance(anomaly, dict):
+                continue
+            if anomaly.get("status") != "FIXED":
+                continue
+            reward = anomaly.get("reward", {})
+            if isinstance(reward, dict) and reward.get("state") == "PREPARED":
+                self.issue_reward(anomaly)
+
+    # command helpers ------------------------------------------------------
 
     def format_age(self, seconds):
         seconds = max(0, safe_int(seconds, 0))
         hours = seconds // 3600
         days = hours // 24
-        hours %= 24
+        hours = hours % 24
+        if days:
+            return u"{0}д {1}ч".format(days, hours)
         minutes = (seconds % 3600) // 60
-        return u"{0}д {1}ч".format(days, hours) if days else u"{0}ч {1}м".format(hours, minutes)
+        return u"{0}ч {1}м".format(hours, minutes)
 
     def inspect(self, sender, anomaly):
-        send_message(sender, AnomalyConfig.PREFIX + u"&f{0} &7— {1}, стадия {2} «{3}»".format(
-            anomaly.get("id"), anomaly.get("status"), anomaly.get("stage"), self.stage_name(anomaly.get("stage"))))
-        send_message(sender, u"&7Мир/центр: &f{0} [{1}, {2}] &7R=&f{3}".format(
-            anomaly.get("world"), anomaly.get("x"), anomaly.get("z"), anomaly.get("radius")))
+        reward = anomaly.get("reward", {})
+        surface = len([
+            r for r in anomaly.get("blocks", [])
+            if isinstance(r, dict) and r.get("kind") == "surface"
+        ])
+        unresolved = len(self.unresolved_records(anomaly)) if anomaly.get("status") == "STABILIZING" else 0
+        lines = [
+            AnomalyConfig.PREFIX + u"&f{0} &7— {1}, стадия {2} «{3}»".format(
+                anomaly.get("id"), anomaly.get("status"),
+                anomaly.get("stage"), self.stage_name(anomaly.get("stage"))
+            ),
+            u"&7Мир/центр: &f{0} [{1}, {2}] &7R=&f{3}".format(
+                anomaly.get("world"), anomaly.get("x"),
+                anomaly.get("z"), anomaly.get("radius")
+            ),
+            u"&7Источник: &f{0} &7город=&f{1} &7игрок=&f{2}".format(
+                anomaly.get("source_type"),
+                anomaly.get("city_name") or u"-",
+                anomaly.get("source_player_name") or u"-"
+            ),
+            u"&7Возраст стадии: &f{0} &7изменённых поверхностей: &f{1}".format(
+                self.format_age(now_ts() - safe_int(anomaly.get("stage_started_at"), now_ts())),
+                surface
+            ),
+            u"&7Репортёр: &f{0} &7reward=&f{1} &8({2})".format(
+                anomaly.get("reporter_name") or u"-",
+                reward.get("state", "NOT_READY"),
+                reward.get("operation_id", "-")
+            )
+        ]
+        if unresolved:
+            lines.append(u"&7Осталось восстановить/проверить: &f{0}".format(unresolved))
+        if reward.get("last_error"):
+            lines.append(u"&cReward error: &f" + to_unicode(reward.get("last_error")))
+        for line in lines:
+            send_message(sender, line)
 
     def admin_list(self, sender):
-        anomalies = sorted(self.data.get("anomalies", {}).values(), key=lambda a: to_unicode(a.get("id")))
+        anomalies = sorted(
+            self.data.get("anomalies", {}).values(),
+            key=lambda item: to_unicode(item.get("id")) if isinstance(item, dict) else u""
+        )
+        if not anomalies:
+            send_message(sender, AnomalyConfig.PREFIX + u"&7Аномалий нет.")
+            return
         send_message(sender, AnomalyConfig.PREFIX + u"&fВсе зоны: &7{0}".format(len(anomalies)))
         for anomaly in anomalies:
-            send_message(sender, u"&8- &f{0} &7{1} S{2} R{3} — {4} [{5}, {6}]".format(
-                anomaly.get("id"), anomaly.get("status"), anomaly.get("stage"), anomaly.get("radius"),
-                anomaly.get("world"), anomaly.get("x"), anomaly.get("z")))
+            send_message(
+                sender,
+                u"&8- &f{0} &7{1} S{2} R{3} — {4} [{5}, {6}]".format(
+                    anomaly.get("id"), anomaly.get("status"),
+                    anomaly.get("stage"), anomaly.get("radius"),
+                    anomaly.get("world"), anomaly.get("x"), anomaly.get("z")
+                )
+            )
 
     def debug_all(self, sender):
-        self.admin_list(sender)
+        anomalies = sorted(
+            self.non_closed_anomalies(),
+            key=lambda item: to_unicode(item.get("id"))
+        )
+        send_message(
+            sender,
+            AnomalyConfig.PREFIX + u"&eDEBUG: &f{0} незакрытых аномалий.".format(len(anomalies))
+        )
+        for anomaly in anomalies:
+            reward = anomaly.get("reward", {})
+            states = {}
+            for record in anomaly.get("blocks", []):
+                state = to_unicode(record.get("state", "UNKNOWN"))
+                states[state] = states.get(state, 0) + 1
+            send_message(
+                sender,
+                u"&8- &f{0} &7status={1} S{2} {3}[{4},{5}] "
+                u"blocks={6} states={7} reporter={8} reward={9}".format(
+                    anomaly.get("id"), anomaly.get("status"),
+                    anomaly.get("stage"), anomaly.get("world"),
+                    anomaly.get("x"), anomaly.get("z"),
+                    len(anomaly.get("blocks", [])), states,
+                    anomaly.get("reporter_name") or "-",
+                    reward.get("state", "NOT_READY")
+                )
+            )
 
     def public_info(self, sender):
         if not isinstance(sender, Player):
@@ -2318,35 +2776,89 @@ class AnomalyManager(object):
         if anomaly is None:
             self.send_unknown_command(sender)
             return True
-        send_message(sender, u"&8Искажение мира: &7стадия &f{0} — «{1}»&7, примерный радиус &f~{2} блоков&7.".format(
-            anomaly.get("stage"), self.stage_name(anomaly.get("stage")), anomaly.get("radius")))
+        send_message(
+            sender,
+            u"&8Искажение мира: &7стадия &f{0} — «{1}»&7, примерный радиус &f~{2} блоков&7."
+            .format(
+                anomaly.get("stage"),
+                self.stage_name(anomaly.get("stage")),
+                anomaly.get("radius")
+            )
+        )
         return True
 
     def resolve_reporter(self, player_name):
+        online = None
         try:
             online = Bukkit.getPlayer(to_java_string(player_name))
-            if online is not None:
-                return str(online.getUniqueId()), to_unicode(online.getName())
+        except Exception:
+            online = None
+        if online is not None:
+            return str(online.getUniqueId()), to_unicode(online.getName())
+
+        economy = self.get_economy_manager()
+        if economy is not None and hasattr(economy, "get_account_by_name"):
+            try:
+                account = economy.get_account_by_name(to_java_string(player_name))
+                if account is not None:
+                    uuid_str = str(account.uuid)
+                    name = to_unicode(account.name or player_name)
+                    return uuid_str, name
+            except Exception:
+                pass
+
+        try:
+            offline = Bukkit.getOfflinePlayer(to_java_string(player_name))
+            if offline is not None:
+                try:
+                    if hasattr(offline, "hasPlayedBefore") and not offline.hasPlayedBefore():
+                        return None, None
+                except Exception:
+                    pass
+                return str(offline.getUniqueId()), to_unicode(offline.getName() or player_name)
         except Exception:
             pass
         return None, None
 
     def set_reporter(self, anomaly, player_name):
+        current_reward = anomaly.get("reward", {})
+        if current_reward.get("state") in ("PREPARED", "PAID", "REVIEW_REQUIRED"):
+            return False, u"репортёра нельзя менять после начала/завершения reward-операции"
         uuid_str, resolved_name = self.resolve_reporter(player_name)
         if not uuid_str:
             return False, u"игрок не найден"
+        old_uuid = anomaly.get("reporter_uuid")
+        old_name = anomaly.get("reporter_name")
         anomaly["reporter_uuid"] = uuid_str
         anomaly["reporter_name"] = resolved_name
+        reward = anomaly.setdefault("reward", {})
+        if reward.get("state") != "PAID":
+            reward["state"] = "NOT_READY"
+            reward["before_balance"] = None
+            reward["expected_balance"] = None
+            reward["last_error"] = None
         if not self.storage.save(self.data):
+            anomaly["reporter_uuid"] = old_uuid
+            anomaly["reporter_name"] = old_name
             return False, u"не удалось сохранить репортёра"
         return True, u"репортёр назначен: {0}".format(resolved_name)
 
     def remove_anomaly(self, anomaly):
-        if anomaly.get("status") != "FIXED":
-            return False
         anomaly_id = anomaly.get("id")
+        if anomaly.get("status") != "FIXED":
+            log_error(u"Refused to delete anomaly {0}: status={1}; run stabilization or cleanupall first".format(
+                anomaly_id, anomaly.get("status")
+            ))
+            return False
+        self.remove_bossbar(anomaly_id)
+        snapshot = anomaly
         self.data.get("anomalies", {}).pop(anomaly_id, None)
-        return self.storage.save(self.data)
+        if not self.storage.save(self.data):
+            self.data.setdefault("anomalies", {})[anomaly_id] = snapshot
+            log_error(u"Cannot delete anomaly {0}: journal save failed".format(anomaly_id))
+            return False
+        log_action(u"Deleted FIXED anomaly record {0}".format(anomaly_id))
+        return True
 
     def online_player_by_uuid(self, uuid_key):
         try:
@@ -2360,18 +2872,36 @@ class AnomalyManager(object):
     def teleport_to_anomaly_for_cleanup(self, player, anomaly):
         try:
             world = Bukkit.getWorld(to_java_string(anomaly.get("world")))
-            target = Location(world, float(anomaly.get("x")) + 0.5, float(anomaly.get("y")) + 2.0, float(anomaly.get("z")) + 0.5)
+            if world is None or Location is None:
+                log_error(u"Cleanup cannot teleport to {0}: world or Location unavailable".format(
+                    anomaly.get("id")
+                ))
+                return False
+            target = Location(
+                world, float(anomaly.get("x")) + 0.5,
+                float(anomaly.get("y")) + 2.0,
+                float(anomaly.get("z")) + 0.5
+            )
             return bool(player.teleport(target))
-        except Exception:
+        except Exception as exc:
+            log_error(u"Cleanup teleport failed for {0}".format(anomaly.get("id")), exc)
             return False
 
     def start_cleanup_all(self, player):
         if self.cleanup_session is not None:
             return False, u"очистка уже выполняется"
-        queue = sorted([a.get("id") for a in self.non_closed_anomalies() if a.get("status") in ("ACTIVE", "STABILIZING")])
+        queue = [
+            anomaly.get("id") for anomaly in self.non_closed_anomalies()
+            if anomaly.get("status") in ("ACTIVE", "STABILIZING")
+        ]
         if not queue:
             return False, u"активных аномалий нет"
-        self.cleanup_session = {"player_uuid": str(player.getUniqueId()), "queue": queue, "current": None}
+        queue.sort()
+        self.cleanup_session = {
+            "player_uuid": str(player.getUniqueId()),
+            "queue": queue,
+            "current": None
+        }
         return True, u"запущена очистка {0} аномалий".format(len(queue))
 
     def cleanup_all_cycle(self):
@@ -2380,481 +2910,467 @@ class AnomalyManager(object):
             return
         player = self.online_player_by_uuid(session.get("player_uuid"))
         if player is None:
+            log_error(u"Mass anomaly cleanup stopped: initiating player went offline")
             self.cleanup_session = None
             return
         current_id = session.get("current")
         if current_id:
             anomaly = self.get_anomaly(current_id)
-            if anomaly is None or anomaly.get("status") == "FIXED":
+            if anomaly is None:
+                log_error(u"Mass cleanup cannot find anomaly {0}".format(current_id))
                 session["current"] = None
                 return
-            self.teleport_to_anomaly_for_cleanup(player, anomaly)
+            if anomaly.get("status") == "FIXED":
+                session["current"] = None
+                return
+            # Keep the operator at this anomaly while its loaded chunks are
+            # restored.  No chunks are force-loaded by the script.
+            if not self.teleport_to_anomaly_for_cleanup(player, anomaly):
+                log_error(u"Mass cleanup cannot load anomaly {0} by teleport".format(current_id))
+                return
             if anomaly.get("status") == "ACTIVE":
                 anomaly["admin_cleanup"] = True
                 self.start_stabilization(anomaly)
             return
         if session.get("queue"):
-            anomaly = self.get_anomaly(session["queue"].pop(0))
+            anomaly_id = session["queue"].pop(0)
+            anomaly = self.get_anomaly(anomaly_id)
             if anomaly is None:
+                log_error(u"Mass cleanup queue references missing anomaly {0}".format(anomaly_id))
                 return
-            session["current"] = anomaly.get("id")
+            if anomaly.get("status") == "FIXED":
+                return
+            session["current"] = anomaly_id
             anomaly["admin_cleanup"] = True
-            self.teleport_to_anomaly_for_cleanup(player, anomaly)
-            self.start_stabilization(anomaly)
+            if not self.teleport_to_anomaly_for_cleanup(player, anomaly):
+                log_error(u"Mass cleanup cannot begin for {0}: teleport failed".format(anomaly_id))
+                return
+            ok, message = self.start_stabilization(anomaly)
+            if not ok and anomaly.get("status") != "STABILIZING":
+                log_error(u"Mass cleanup cannot start stabilization for {0}: {1}".format(
+                    anomaly_id, message
+                ))
             return
         self.cleanup_session = None
+        log_action(u"Mass anomaly cleanup completed")
         send_message(player, AnomalyConfig.PREFIX + u"&aВсе аномалии восстановлены и закрыты.")
 
     def admin_help(self, sender):
-        for line in [u"&f/anomaly start|stop|list", u"&f/anomaly inspect <id>", u"&f/anomaly create <город> | createhere",
-                     u"&f/anomaly stage <id> next", u"&f/anomaly reporter <id> <игрок>",
-                     u"&f/anomaly stabilize <id|nearest>", u"&f/anomaly dismiss <latest|nearest|id>",
-                     u"&f/anomaly cleanupall confirm", u"&f/anomaly save|reload", u"&f/anomaly debug [id]"]:
+        lines = [
+            u"&f/anomaly start|stop|list",
+            u"&f/anomaly autostatus &8(таймер и причины последнего автоспавна)",
+            u"&f/anomaly coreprotect &8(состояние резервного журнала)",
+            u"&f/anomaly inspect <id>",
+            u"&f/anomaly create <город> &8| &fcreatehere",
+            u"&f/anomaly stage <id> next",
+            u"&f/anomaly reporter <id> <игрок>",
+            u"&f/anomaly stabilize <id|nearest>",
+            u"&f/anomaly dismiss <latest|nearest|id> &8(срочно и без координат)",
+            u"&f/anomaly reward retry <id>",
+            u"&f/anomaly remove <id> confirm",
+            u"&f/anomaly cleanupall confirm &8(телепорт и безопасное восстановление)",
+            u"&f/anomaly save|reload",
+            u"&f/anomaly debug [id]"
+        ]
+        send_message(sender, AnomalyConfig.PREFIX + u"&7Админ-команды:")
+        for line in lines:
             send_message(sender, line)
 
     def handle_command(self, sender, args):
         args = [to_unicode(arg) for arg in args]
         sub = args[0].lower() if args else ""
+
         if not self.is_admin(sender):
             if sub == "info":
                 return self.public_info(sender)
             self.send_unknown_command(sender)
             return True
+
         if not sub:
-            self.admin_help(sender); return True
+            self.admin_help(sender)
+            return True
+
+        if sub == "info":
+            if isinstance(sender, Player):
+                anomaly = self.anomaly_at_location(sender.getLocation())
+                if anomaly is None:
+                    send_message(sender, AnomalyConfig.PREFIX + u"&7Вы не находитесь внутри активной аномалии.")
+                else:
+                    self.inspect(sender, anomaly)
+            else:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cКоманда доступна игроку.")
+            return True
+
         if sub == "start":
-            self.data["auto_spawn"] = True; self.storage.save(self.data); send_message(sender, AnomalyConfig.PREFIX + u"&aАвтоспавн включён."); return True
+            old = bool(self.data.get("auto_spawn"))
+            self.data["auto_spawn"] = True
+            if self.storage.save(self.data):
+                send_message(sender, AnomalyConfig.PREFIX + u"&aАвтоспавн включён.")
+            else:
+                self.data["auto_spawn"] = old
+                send_message(sender, AnomalyConfig.PREFIX + u"&cНе удалось сохранить настройку.")
+            return True
+
         if sub == "stop":
-            self.data["auto_spawn"] = False; self.storage.save(self.data); send_message(sender, AnomalyConfig.PREFIX + u"&eАвтоспавн выключен."); return True
-        if sub == "list": self.admin_list(sender); return True
-        if sub == "autostatus": self.auto_status(sender); return True
-        if sub == "coreprotect": self.coreprotect_status(sender); return True
-        if sub in ("inspect", "debug"):
+            old = bool(self.data.get("auto_spawn"))
+            self.data["auto_spawn"] = False
+            if self.storage.save(self.data):
+                send_message(sender, AnomalyConfig.PREFIX + u"&eАвтоспавн выключен. Существующие зоны сохранены.")
+            else:
+                self.data["auto_spawn"] = old
+                send_message(sender, AnomalyConfig.PREFIX + u"&cНе удалось сохранить настройку.")
+            return True
+
+        if sub == "list":
+            self.admin_list(sender)
+            return True
+
+        if sub == "autostatus":
+            self.auto_status(sender)
+            return True
+
+        if sub == "coreprotect":
+            self.coreprotect_status(sender)
+            return True
+
+        if sub == "inspect":
+            if len(args) < 2:
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly inspect <id>")
+                return True
+            anomaly = self.get_anomaly(args[1])
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cАномалия не найдена.")
+            else:
+                self.inspect(sender, anomaly)
+            return True
+
+        if sub == "debug":
             if len(args) >= 2:
                 anomaly = self.get_anomaly(args[1])
-                if anomaly: self.inspect(sender, anomaly)
-            else: self.debug_all(sender)
+                if anomaly is None:
+                    send_message(sender, AnomalyConfig.PREFIX + u"&cАномалия не найдена.")
+                else:
+                    self.inspect(sender, anomaly)
+            else:
+                self.debug_all(sender)
             return True
-        if sub == "createhere" and isinstance(sender, Player):
-            anomaly, reason = self.create_here(sender); send_message(sender, AnomalyConfig.PREFIX + (u"&aСоздано." if anomaly else u"&c" + reason)); return True
-        if sub == "stage" and len(args) >= 3:
-            anomaly = self.get_anomaly(args[1]); ok, msg = self.manual_next_stage(anomaly) if anomaly else (False, u"не найдено"); send_message(sender, msg); return True
-        if sub == "reporter" and len(args) >= 3:
-            anomaly = self.get_anomaly(args[1]); ok, msg = self.set_reporter(anomaly, args[2]) if anomaly else (False, u"не найдено"); send_message(sender, msg); return True
-        if sub == "stabilize" and len(args) >= 2:
-            anomaly = self.nearest_anomaly(sender.getLocation(), 100.0) if args[1].lower() == "nearest" and isinstance(sender, Player) else self.get_anomaly(args[1])
-            ok, msg = self.start_stabilization(anomaly) if anomaly else (False, u"не найдено"); send_message(sender, msg); return True
-        if sub == "dismiss" and len(args) >= 2:
-            anomaly = self.latest_active_anomaly() if args[1].lower() == "latest" else self.get_anomaly(args[1]); ok, msg = self.start_quiet_removal(anomaly); send_message(sender, msg); return True
-        if sub == "cleanupall" and len(args) >= 2 and args[1].lower() == "confirm" and isinstance(sender, Player):
-            ok, msg = self.start_cleanup_all(sender); send_message(sender, msg); return True
-        if sub == "save": self.storage.save(self.data); send_message(sender, u"&aСохранено."); return True
-        if sub == "reload": self.data = self.storage.load(); self.normalize_runtime_data(); send_message(sender, u"&aПеречитано."); return True
-        self.admin_help(sender); return True
+
+        if sub == "create":
+            if len(args) < 2:
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly create <город>")
+                return True
+            city = self.find_city_by_name(u" ".join(args[1:]))
+            if city is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cГород не найден.")
+                return True
+            anomaly, reason = self.create_for_city(city)
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cНе создано: " + reason)
+            else:
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&aСоздана &f{0}&a около города &f{1}&a. Координаты записаны только в приватный журнал."
+                    .format(anomaly.get("id"), city.get("name"))
+                )
+            return True
+
+        if sub == "createhere":
+            if not isinstance(sender, Player):
+                send_message(sender, AnomalyConfig.PREFIX + u"&cКоманда доступна только игроку.")
+                return True
+            anomaly, reason = self.create_here(sender)
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cНе создано: " + reason)
+            else:
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&aСоздана &f{0}&a. Координаты записаны только в приватный журнал."
+                    .format(anomaly.get("id"))
+                )
+            return True
+
+        if sub == "stage":
+            if len(args) < 3 or args[2].lower() != "next":
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly stage <id> next")
+                return True
+            anomaly = self.get_anomaly(args[1])
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cАномалия не найдена.")
+                return True
+            ok, message = self.manual_next_stage(anomaly)
+            send_message(sender, AnomalyConfig.PREFIX + (u"&a" if ok else u"&c") + message)
+            return True
+
+        if sub == "reporter":
+            if len(args) < 3:
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly reporter <id> <игрок>")
+                return True
+            anomaly = self.get_anomaly(args[1])
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cАномалия не найдена.")
+                return True
+            ok, message = self.set_reporter(anomaly, args[2])
+            send_message(sender, AnomalyConfig.PREFIX + (u"&a" if ok else u"&c") + message)
+            return True
+
+        if sub == "stabilize":
+            if len(args) < 2:
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly stabilize <id|nearest>")
+                return True
+            anomaly = None
+            if args[1].lower() == "nearest":
+                if not isinstance(sender, Player):
+                    send_message(sender, AnomalyConfig.PREFIX + u"&cnearest доступен только игроку.")
+                    return True
+                anomaly = self.nearest_anomaly(sender.getLocation(), 100.0)
+            else:
+                anomaly = self.get_anomaly(args[1])
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cАктивная аномалия не найдена.")
+                return True
+            ok, message = self.start_stabilization(anomaly)
+            send_message(sender, AnomalyConfig.PREFIX + (u"&a" if ok else u"&c") + message)
+            return True
+
+        if sub == "dismiss":
+            if len(args) < 2:
+                send_message(sender, AnomalyConfig.PREFIX +
+                             u"&c/anomaly dismiss <latest|nearest|id>")
+                return True
+            target = args[1].lower()
+            anomaly = None
+            if target == "latest":
+                anomaly = self.latest_active_anomaly()
+            elif target == "nearest":
+                if not isinstance(sender, Player):
+                    send_message(sender, AnomalyConfig.PREFIX +
+                                 u"&cnearest доступен только игроку; используй latest или ID.")
+                    return True
+                anomaly = self.nearest_anomaly(sender.getLocation(), 250.0)
+            else:
+                anomaly = self.get_anomaly(args[1])
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cАктивная аномалия не найдена.")
+                return True
+            ok, message = self.start_quiet_removal(anomaly)
+            send_message(sender, AnomalyConfig.PREFIX +
+                         (u"&a" if ok else u"&c") + message)
+            return True
+
+        if sub == "reward":
+            if len(args) < 3 or args[1].lower() != "retry":
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly reward retry <id>")
+                return True
+            anomaly = self.get_anomaly(args[2])
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cАномалия не найдена.")
+                return True
+            if anomaly.get("status") != "FIXED":
+                send_message(sender, AnomalyConfig.PREFIX + u"&cНаграда доступна только после FIXED.")
+                return True
+            ok, message = self.issue_reward(anomaly)
+            send_message(sender, AnomalyConfig.PREFIX + (u"&a" if ok else u"&c") + message)
+            return True
+
+        if sub == "remove":
+            if len(args) < 3 or args[2].lower() != "confirm":
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly remove <id> confirm")
+                return True
+            anomaly = self.get_anomaly(args[1])
+            if anomaly is None:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cАномалия не найдена.")
+                return True
+            if self.remove_anomaly(anomaly):
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&aЗапись закрытой аномалии удалена."
+                )
+            else:
+                send_message(sender, AnomalyConfig.PREFIX +
+                             u"&cУдаление отклонено или не сохранено. Сначала восстанови её через stabilize/cleanupall; подробности в anomaly-errors.log.")
+            return True
+
+        if sub == "cleanupall":
+            if len(args) < 2 or args[1].lower() != "confirm":
+                send_message(sender, AnomalyConfig.PREFIX + u"&c/anomaly cleanupall confirm")
+                return True
+            if not isinstance(sender, Player):
+                send_message(sender, AnomalyConfig.PREFIX + u"&cКоманда доступна только игроку: он загружает чанки телепортацией.")
+                return True
+            ok, message = self.start_cleanup_all(sender)
+            send_message(sender, AnomalyConfig.PREFIX + (u"&a" if ok else u"&c") + message)
+            return True
+
+        if sub == "save":
+            if self.storage.save(self.data):
+                self.dirty = False
+                send_message(sender, AnomalyConfig.PREFIX + u"&aДанные сохранены.")
+            else:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cОшибка сохранения.")
+            return True
+
+        if sub == "reload":
+            loaded = self.storage.load()
+            if not self.storage.loaded_ok:
+                send_message(sender, AnomalyConfig.PREFIX + u"&cПерезагрузка отклонена: данные не прочитаны.")
+                return True
+            self.remove_all_bossbars()
+            self.data = loaded
+            self.normalize_runtime_data()
+            self.reconcile_planned_records()
+            self.resume_bossbars()
+            self.recover_prepared_rewards()
+            send_message(sender, AnomalyConfig.PREFIX + u"&aДанные перечитаны.")
+            return True
+
+        self.admin_help(sender)
+        return True
 
     def tab_complete(self, sender, args):
         if not self.is_admin(sender):
             return []
-        args = [to_unicode(a) for a in args]
+        args = [to_unicode(arg) for arg in args]
         if len(args) <= 1:
+            options = [
+                "start", "stop", "list", "autostatus", "coreprotect", "inspect", "create", "createhere",
+                "stage", "reporter", "stabilize", "dismiss", "reward", "remove", "cleanupall",
+                "save", "reload", "debug"
+            ]
             prefix = args[0].lower() if args else ""
-            return [x for x in ("start","stop","list","autostatus","coreprotect","inspect","create","createhere","stage","reporter","stabilize","dismiss","cleanupall","save","reload","debug") if x.startswith(prefix)]
+            return [item for item in options if item.startswith(prefix)]
+        sub = args[0].lower()
+        prefix = args[-1].upper()
+        if sub in ("inspect", "stage", "reporter", "remove", "debug"):
+            if len(args) == 2:
+                return [
+                    anomaly.get("id") for anomaly in self.non_closed_anomalies()
+                    if to_unicode(anomaly.get("id")).upper().startswith(prefix)
+                ]
+        if sub == "stabilize" and len(args) == 2:
+            options = ["nearest"] + [
+                anomaly.get("id") for anomaly in self.active_anomalies()
+            ]
+            low = args[-1].lower()
+            return [
+                item for item in options
+                if to_unicode(item).lower().startswith(low)
+            ]
+        if sub == "dismiss" and len(args) == 2:
+            options = ["latest", "nearest"] + [
+                anomaly.get("id") for anomaly in self.active_anomalies()
+            ]
+            low = args[-1].lower()
+            return [item for item in options if to_unicode(item).lower().startswith(low)]
+        if sub == "stage" and len(args) == 3:
+            return ["next"] if "next".startswith(args[-1].lower()) else []
+        if sub == "reward":
+            if len(args) == 2:
+                return ["retry"] if "retry".startswith(args[-1].lower()) else []
+            if len(args) == 3 and args[1].lower() == "retry":
+                return [
+                    anomaly.get("id")
+                    for anomaly in self.data.get("anomalies", {}).values()
+                    if to_unicode(anomaly.get("id")).upper().startswith(prefix)
+                ]
+        if sub == "remove" and len(args) == 3:
+            return ["confirm"] if "confirm".startswith(args[-1].lower()) else []
+        if sub == "cleanupall" and len(args) == 2:
+            return ["confirm"] if "confirm".startswith(args[-1].lower()) else []
+        if sub == "reporter" and len(args) == 3:
+            try:
+                names = [to_unicode(p.getName()) for p in Bukkit.getOnlinePlayers()]
+                low = args[-1].lower()
+                return [name for name in names if name.lower().startswith(low)]
+            except Exception:
+                return []
+        if sub == "create" and len(args) >= 2:
+            low = u" ".join(args[1:]).lower()
+            names = [to_unicode(city.get("name")) for city in self.get_city_records()]
+            return [name for name in names if name.lower().startswith(low)]
         return []
 
 
 class AnomalyCommand(Command, TabCompleter):
     def __init__(self, manager):
-        Command.__init__(self, "anomaly", "Server anomaly administration", "/anomaly", build_java_list([]))
+        aliases = build_java_list([])
+        Command.__init__(
+            self, "anomaly",
+            "Server anomaly administration",
+            "/anomaly",
+            aliases
+        )
         self.manager = manager
         try:
             self.setPermission(to_java_string(AnomalyConfig.ADMIN_PERMISSION))
         except Exception:
             pass
+
     def execute(self, sender, command_label, args):
         try:
             return bool(self.manager.handle_command(sender, list(args)))
         except Exception as exc:
-            log_error(u"/anomaly execution error", exc); return True
+            log_error(u"/anomaly execution error", exc)
+            if self.manager.is_admin(sender):
+                send_message(
+                    sender,
+                    AnomalyConfig.PREFIX +
+                    u"&cВнутренняя ошибка. Подробности в консоли."
+                )
+            else:
+                self.manager.send_unknown_command(sender)
+            return True
+
     def tabComplete(self, sender, alias, args, location=None):
-        return build_java_list(self.manager.tab_complete(sender, list(args)))
+        try:
+            return build_java_list(
+                self.manager.tab_complete(sender, list(args))
+            )
+        except Exception as exc:
+            log_error(u"Tab completion error", exc)
+            return build_java_list([])
 
 
 manager = None
+
 
 def on_enable():
     global manager
     if JAVA_AVAILABLE and System is not None:
         try:
             old = System.getProperties().get(AnomalyConfig.MANAGER_PROPERTY)
-            if old is not None and old is not manager and hasattr(old, "shutdown_from_replacement"):
+            if (
+                    old is not None and
+                    old is not manager and
+                    hasattr(old, "shutdown_from_replacement")
+            ):
                 old.shutdown_from_replacement()
-        except Exception:
-            pass
-    manager = AnomalyManager()
-    manager.start()
+        except Exception as exc:
+            log_error(u"Failed to stop previous anomaly manager during reload", exc)
+    try:
+        manager = AnomalyManager()
+        manager.start()
+    except Exception as exc:
+        log_error(u"Fatal anomaly startup error", exc)
+        manager = None
+        raise
+
 
 def on_disable():
     global manager
     if manager is not None:
-        manager.stop()
+        try:
+            manager.stop()
+        except Exception as exc:
+            log_error(u"Shutdown error", exc)
     manager = None
+
 
 def stop(script=None):
     on_disable()
+
 
 if __name__ == "__main__" or "ps" in globals() or "command_manager" in globals():
     on_enable()
-
-# =============================================================================
-# PLAYER INFECTION — event phase / test-cg
-# =============================================================================
-try:
-    from org.bukkit import Sound as _InfSound, NamespacedKey as _InfKey
-except Exception:
-    _InfSound = None
-    _InfKey = None
-
-INF_PROPERTY = "SmartY_AnomalyInfectionController"
-INF_FILE = os.path.join(AnomalyConfig.DATA_DIR, "anomaly-infections.json")
-INF_BACKUP = INF_FILE + ".bak"
-INF_ZONE_INTERVAL = 5
-INF_ZONE_CHANCE = 0.25
-INF_CONTACT_INTERVAL = 5
-INF_CONTACT_RADIUS = 5.0
-INF_STAGE1_SECONDS = 2 * 3600
-INF_STAGE2_SECONDS = 4 * 3600
-INF_INSOMNIA_CHANCE = 0.50
-INF_COMPASS_INTERVAL = 3
-
-def _inf_effect(name, fallback=None):
-    if PotionEffectType is None:
-        return None
-    try:
-        value = getattr(PotionEffectType, name, None)
-        if value is not None:
-            return value
-    except Exception:
-        pass
-    try:
-        if _InfKey is not None and hasattr(PotionEffectType, "getByKey"):
-            value = PotionEffectType.getByKey(_InfKey.minecraft(name.lower()))
-            if value is not None:
-                return value
-    except Exception:
-        pass
-    if fallback:
-        try:
-            return getattr(PotionEffectType, fallback, None)
-        except Exception:
-            pass
-    return None
-
-_INF_NAUSEA = _inf_effect("NAUSEA", "CONFUSION")
-_INF_DARKNESS = _inf_effect("DARKNESS")
-
-class AnomalyInfectionController(object):
-    def __init__(self, anomaly_manager):
-        self.manager = anomaly_manager
-        self.plugin = anomaly_manager.plugin
-        self.active = False
-        self.listeners = []
-        self.task_ids = []
-        self.data = self._load()
-        self.zone_next = {}
-        self.symptom_next = {}
-        self.compass_next = {}
-        self.contact_next = 0
-        self.last_pulse_key = None
-        self.old_handle = None
-        self.old_tab = None
-        self._normalize()
-
-    def _default(self): return {"schema_version": 1, "players": {}}
-    def _normalize(self):
-        if not isinstance(self.data, dict): self.data = self._default()
-        if not isinstance(self.data.get("players"), dict): self.data["players"] = {}
-        for uid_key in list(self.data["players"].keys()):
-            r = self.data["players"].get(uid_key)
-            if not isinstance(r, dict):
-                self.data["players"].pop(uid_key, None); continue
-            r.setdefault("uuid", uid_key); r.setdefault("name", u"?")
-            r.setdefault("infected_at", now_ts()); r["stage"] = max(1, min(3, safe_int(r.get("stage"), 1)))
-            r.setdefault("stage_started_at", r.get("infected_at", now_ts())); r.setdefault("source", "UNKNOWN")
-            r.setdefault("source_anomaly_id", None); r.setdefault("source_player_uuid", None)
-            r.setdefault("insomnia_night_key", None); r.setdefault("insomnia_blocked", False)
-
-    def _load_path(self, path):
-        with open(path, "r") as handle: raw = json.load(handle, parse_constant=reject_json_constant)
-        if not isinstance(raw, dict): raise ValueError("infection database root must be an object")
-        return raw
-    def _load(self):
-        try:
-            if os.path.exists(INF_FILE): return self._load_path(INF_FILE)
-        except Exception as exc: log_error(u"Cannot read anomaly-infections.json", exc)
-        try:
-            if os.path.exists(INF_BACKUP): return self._load_path(INF_BACKUP)
-        except Exception as exc: log_error(u"Cannot read infection backup", exc)
-        return self._default()
-    def _save(self):
-        try:
-            if not os.path.exists(AnomalyConfig.DATA_DIR): os.makedirs(AnomalyConfig.DATA_DIR)
-            temp = INF_FILE + ".tmp"
-            with open(temp, "w") as handle:
-                handle.write(json.dumps(self.data, indent=2, ensure_ascii=True, sort_keys=True, allow_nan=False)); handle.flush()
-                try: os.fsync(handle.fileno())
-                except Exception: pass
-            if os.path.exists(INF_FILE):
-                backup_tmp = INF_BACKUP + ".tmp"
-                with open(INF_FILE, "rb") as source:
-                    with open(backup_tmp, "wb") as target: target.write(source.read()); target.flush()
-                atomic_replace_file(backup_tmp, INF_BACKUP)
-            atomic_replace_file(temp, INF_FILE); return True
-        except Exception as exc:
-            log_error(u"Cannot save anomaly-infections.json", exc); return False
-
-    def start(self):
-        self.active = True
-        self._register_event(PlayerBedEnterEvent, self.on_bed, EventPriority.HIGHEST)
-        self._schedule(self.tick, 20, 20)
-        self._patch_commands()
-        log_action(u"Infection system started; infected={0}.".format(len(self.data["players"])))
-    def stop(self):
-        self.active = False; self._unpatch_commands()
-        for listener in self.listeners:
-            try: HandlerList.unregisterAll(listener)
-            except Exception: pass
-        for task_id in self.task_ids:
-            try: Bukkit.getScheduler().cancelTask(int(task_id))
-            except Exception: pass
-        self.listeners = []; self.task_ids = []; self._save()
-    def _register_event(self, event_class, callback, priority):
-        listener = EmptyListener(); executor = CallbackExecutor(callback)
-        Bukkit.getPluginManager().registerEvent(event_class, listener, priority, executor, self.plugin, False)
-        self.listeners.append(listener)
-    def _schedule(self, callback, delay, period):
-        task = Bukkit.getScheduler().runTaskTimer(self.plugin, CallbackRunnable(callback), int(delay), int(period))
-        self.task_ids.append(int(task.getTaskId()))
-    def uid(self, player): return str(player.getUniqueId())
-    def record(self, player): return self.data["players"].get(self.uid(player))
-
-    def infect(self, player, source="ZONE", anomaly=None, source_player=None, stage=1):
-        uid_key = self.uid(player)
-        if uid_key in self.data["players"]: return False
-        now = now_ts(); stage = max(1, min(3, safe_int(stage, 1)))
-        self.data["players"][uid_key] = {
-            "uuid": uid_key, "name": to_unicode(player.getName()), "infected_at": now,
-            "stage": stage, "stage_started_at": now, "source": to_unicode(source),
-            "source_anomaly_id": anomaly.get("id") if isinstance(anomaly, dict) else None,
-            "source_player_uuid": self.uid(source_player) if source_player is not None else None,
-            "insomnia_night_key": None, "insomnia_blocked": False
-        }
-        self.zone_next.pop(uid_key, None); self.symptom_next[uid_key] = now + random.randint(120, 300)
-        if not self._save(): self.data["players"].pop(uid_key, None); return False
-        log_action(u"Player infected: {0}, source={1}.".format(player.getName(), source)); return True
-    def clear(self, player):
-        uid_key = self.uid(player); removed = self.data["players"].pop(uid_key, None)
-        self.zone_next.pop(uid_key, None); self.symptom_next.pop(uid_key, None); self.compass_next.pop(uid_key, None)
-        try: player.setCompassTarget(player.getWorld().getSpawnLocation())
-        except Exception: pass
-        if removed is None: return False
-        self._save(); return True
-    def set_stage(self, player, stage):
-        stage = max(1, min(3, safe_int(stage, 1))); r = self.record(player)
-        if r is None: return self.infect(player, "ADMIN", stage=stage)
-        r["stage"] = stage; r["stage_started_at"] = now_ts(); r["insomnia_night_key"] = None; r["insomnia_blocked"] = False
-        self.symptom_next[self.uid(player)] = now_ts() + 5; self._save(); return True
-
-    def _sound(self, name):
-        try: return getattr(_InfSound, name, None) if _InfSound is not None else None
-        except Exception: return None
-    def _play(self, player, names, volume=0.45, pitch=None):
-        sound = self._sound(random.choice(names))
-        if sound is None: return
-        try: player.playSound(player.getLocation(), sound, float(volume), float(pitch if pitch is not None else random.uniform(0.55, 1.30)))
-        except Exception: pass
-    def _particle(self, names):
-        if Particle is None: return None
-        for name in names:
-            try:
-                value = getattr(Particle, name, None)
-                if value is not None: return value
-            except Exception: pass
-        return None
-    def _particles(self, player, public, count):
-        particle = self._particle(("SCULK_SOUL", "SOUL", "ASH")) if public else self._particle(("ASH", "SOUL", "PORTAL"))
-        if particle is None: return
-        try:
-            loc = player.getLocation().clone().add(0.0, 0.2, 0.0)
-            if public: player.getWorld().spawnParticle(particle, loc, count, 0.45, 0.2, 0.45, 0.015)
-            else: player.spawnParticle(particle, loc, count, 0.35, 0.1, 0.35, 0.01)
-        except Exception: pass
-    def _effect(self, player, effect_type, seconds):
-        if PotionEffect is None or effect_type is None: return
-        try: player.addPotionEffect(PotionEffect(effect_type, int(seconds * 20), 0, False, False, False), True)
-        except Exception: pass
-    def _puke(self, player, lo, hi):
-        try: Bukkit.dispatchCommand(Bukkit.getConsoleSender(), to_java_string(u"brew puke {0} {1}".format(player.getName(), random.randint(lo, hi))))
-        except Exception as exc: self.manager.log_error_throttled("infection-puke", u"Brewery puke failed", exc, 120)
-    def _symptom_delay(self, stage):
-        return random.randint(90, 240) if stage == 1 else (random.randint(45, 120) if stage == 2 else random.randint(30, 90))
-    def _symptom(self, player, stage):
-        strange = ("AMBIENT_CAVE", "BLOCK_SCULK_SENSOR_CLICKING", "ENTITY_ENDERMAN_STARE", "BLOCK_RESPAWN_ANCHOR_DEPLETE")
-        sculk = ("BLOCK_SCULK_SENSOR_CLICKING", "BLOCK_SCULK_SHRIEKER_SHRIEK", "ENTITY_WARDEN_HEARTBEAT", "ENTITY_WARDEN_AMBIENT")
-        if stage == 1:
-            roll = random.random()
-            if roll < 0.55: self._play(player, strange, 0.35)
-            elif roll < 0.78: self._particles(player, False, random.randint(2,5)); self._play(player, strange, 0.25)
-            else:
-                self._effect(player, _INF_NAUSEA, 5); self._play(player, strange, 0.35)
-                if random.random() < 0.35: self._puke(player, 1, 2)
-            return
-        self._play(player, sculk, 0.50)
-        if random.random() < 0.70: self._play(player, strange, 0.30)
-        self._particles(player, True, random.randint(5,10))
-        if random.random() < (0.60 if stage == 2 else 0.78):
-            self._effect(player, _INF_NAUSEA, random.randint(10,15) if stage == 2 else random.randint(12,18))
-            if random.random() < (0.40 if stage == 2 else 0.55): self._puke(player, 2, 4 if stage == 2 else 5)
-
-    def _progress_and_symptoms(self, players, now):
-        for player in players:
-            r = self.record(player)
-            if r is None: continue
-            stage = safe_int(r.get("stage"), 1, 1, 3); started = safe_int(r.get("stage_started_at"), r.get("infected_at", now))
-            wait = INF_STAGE1_SECONDS if stage == 1 else INF_STAGE2_SECONDS
-            if stage < 3 and now - started >= wait:
-                stage += 1; r["stage"] = stage; r["stage_started_at"] = now; r["insomnia_night_key"] = None; r["insomnia_blocked"] = False
-                self.symptom_next[self.uid(player)] = now + random.randint(20,60); self._save()
-            due = safe_int(self.symptom_next.get(self.uid(player)), 0)
-            if due <= 0: self.symptom_next[self.uid(player)] = now + self._symptom_delay(stage)
-            elif now >= due: self._symptom(player, stage); self.symptom_next[self.uid(player)] = now + self._symptom_delay(stage)
-            if stage >= 3: self._random_compass(player, now)
-
-    def _zone_exposure(self, players, now):
-        healthy = set()
-        for player in players:
-            uid_key = self.uid(player)
-            if self.record(player) is not None: self.zone_next.pop(uid_key, None); continue
-            healthy.add(uid_key); anomaly = self.manager.anomaly_at_location(player.getLocation())
-            if anomaly is None: self.zone_next.pop(uid_key, None); continue
-            due = self.zone_next.get(uid_key)
-            if due is not None and now < due: continue
-            self.zone_next[uid_key] = now + INF_ZONE_INTERVAL
-            if random.random() < INF_ZONE_CHANCE: self.infect(player, "ZONE", anomaly=anomaly)
-        for uid_key in list(self.zone_next.keys()):
-            if uid_key not in healthy: self.zone_next.pop(uid_key, None)
-    def _contact_chance(self, distance):
-        if distance > INF_CONTACT_RADIUS: return 0.0
-        return min(0.30, max(0.0, (6.0 - float(distance)) * 0.05))
-    def _contact_spread(self, players, now):
-        if now < self.contact_next: return
-        self.contact_next = now + INF_CONTACT_INTERVAL
-        sources = [p for p in players if self.record(p) is not None and safe_int(self.record(p).get("stage"), 1) >= 2]
-        for target in [p for p in players if self.record(p) is None]:
-            nearest = None; nearest_d = INF_CONTACT_RADIUS + 1.0
-            for source in sources:
-                try:
-                    if source.getWorld() != target.getWorld(): continue
-                    d = source.getLocation().distance(target.getLocation())
-                    if d <= INF_CONTACT_RADIUS and d < nearest_d: nearest, nearest_d = source, d
-                except Exception: pass
-            if nearest is not None and random.random() < self._contact_chance(nearest_d): self.infect(target, "CONTACT", source_player=nearest)
-    def _pulse(self, player, stage):
-        self._effect(player, _INF_DARKNESS, random.randint(2,5)); self._play(player, ("ENTITY_WARDEN_HEARTBEAT","BLOCK_SCULK_SENSOR_CLICKING"), 0.70, random.uniform(0.55,0.80)); self._particles(player, stage >= 2, random.randint(5,12))
-    def _global_pulses(self, players):
-        local = time.localtime(); minute = int(local.tm_min)
-        if minute not in (0,30): return
-        key = time.strftime("%Y%m%d%H%M", local)
-        if key == self.last_pulse_key: return
-        self.last_pulse_key = key
-        for player in players:
-            r = self.record(player)
-            if r is None: continue
-            stage = safe_int(r.get("stage"),1,1,3)
-            if minute == 30 and stage < 3: continue
-            self._pulse(player, stage)
-    def _random_compass(self, player, now):
-        uid_key = self.uid(player)
-        if now < safe_int(self.compass_next.get(uid_key),0): return
-        self.compass_next[uid_key] = now + INF_COMPASS_INTERVAL
-        try:
-            limit = 29900000; player.setCompassTarget(Location(player.getWorld(), random.randint(-limit,limit)+0.5, 64.0, random.randint(-limit,limit)+0.5))
-        except Exception: pass
-    def on_bed(self, event):
-        player = event.getPlayer(); r = self.record(player)
-        if r is None or safe_int(r.get("stage"),1) < 3: return
-        key = u"{0}:{1}".format(player.getWorld().getName(), int(player.getWorld().getFullTime() // 24000))
-        if to_unicode(r.get("insomnia_night_key")) != key:
-            r["insomnia_night_key"] = key; r["insomnia_blocked"] = random.random() < INF_INSOMNIA_CHANCE; self._save()
-        if r.get("insomnia_blocked"): event.setCancelled(True); send_message(player, u"&cВы страдаете бессонницей.")
-    def tick(self):
-        if not self.active or not self.manager.active: return
-        now = now_ts()
-        try: players = list(Bukkit.getOnlinePlayers())
-        except Exception: players = []
-        try: self._zone_exposure(players,now); self._contact_spread(players,now); self._progress_and_symptoms(players,now); self._global_pulses(players)
-        except Exception as exc: self.manager.log_error_throttled("infection-tick", u"Infection cycle failed", exc)
-
-    def _admin(self, sender, args):
-        if not args or args[0].lower() in ("list","status"):
-            if len(args) >= 2:
-                player = Bukkit.getPlayer(to_java_string(args[1])); r = self.record(player) if player is not None else None
-                send_message(sender, AnomalyConfig.PREFIX + (u"&7{0}: стадия {1}, source={2}.".format(player.getName(),r.get("stage"),r.get("source")) if r is not None else u"&7Игрок не заражён/не онлайн.")); return True
-            send_message(sender, AnomalyConfig.PREFIX + u"&7Заражённых: &f{0}".format(len(self.data["players"]))); return True
-        sub = args[0].lower()
-        if sub in ("infect","stage","clear") and len(args) >= 2:
-            player = Bukkit.getPlayer(to_java_string(args[1]))
-            if player is None: send_message(sender,u"&cИгрок должен быть онлайн."); return True
-            if sub == "clear": ok = self.clear(player)
-            else:
-                stage = safe_int(args[2],1,1,3) if len(args)>=3 else 1; ok = self.infect(player,"ADMIN",stage=stage) if sub=="infect" else self.set_stage(player,stage)
-            send_message(sender, u"&aГотово." if ok else u"&eБез изменений."); return True
-        send_message(sender,u"&7infection: list | status <player> | infect <player> [1-3] | stage <player> <1-3> | clear <player>"); return True
-    def _patch_commands(self):
-        self.old_handle = self.manager.handle_command; self.old_tab = self.manager.tab_complete; controller = self; old_handle = self.old_handle; old_tab = self.old_tab
-        def handle(sender,args):
-            converted=[to_unicode(x) for x in args]
-            if converted and converted[0].lower()=="infection" and controller.manager.is_admin(sender): return controller._admin(sender,converted[1:])
-            return old_handle(sender,args)
-        def tab(sender,args):
-            converted=[to_unicode(x) for x in args]
-            if not controller.manager.is_admin(sender): return old_tab(sender,args)
-            if len(converted)<=1:
-                base=list(old_tab(sender,args)); prefix=converted[0].lower() if converted else ""
-                if "infection".startswith(prefix) and "infection" not in base: base.append("infection")
-                return base
-            if converted[0].lower()!="infection": return old_tab(sender,args)
-            if len(converted)==2: return [x for x in ("list","status","infect","stage","clear") if x.startswith(converted[-1].lower())]
-            return []
-        self.manager.handle_command=handle; self.manager.tab_complete=tab
-    def _unpatch_commands(self):
-        try:
-            if self.old_handle is not None: self.manager.handle_command=self.old_handle
-            if self.old_tab is not None: self.manager.tab_complete=self.old_tab
-        except Exception: pass
-
-infection_controller = None
-
-def _start_infection():
-    global infection_controller
-    if manager is None or not BUKKIT_AVAILABLE: return
-    try:
-        old = System.getProperties().get(INF_PROPERTY) if JAVA_AVAILABLE and System is not None else None
-        if old is not None and hasattr(old,"stop"): old.stop()
-    except Exception: pass
-    infection_controller = AnomalyInfectionController(manager); infection_controller.start()
-    try:
-        if JAVA_AVAILABLE and System is not None: System.getProperties().put(INF_PROPERTY,infection_controller)
-    except Exception: pass
-
-_start_infection()
-_base_anomaly_on_disable = on_disable
-
-def on_disable():
-    global infection_controller
-    if infection_controller is not None:
-        try: infection_controller.stop()
-        except Exception as exc: log_error(u"Infection shutdown error",exc)
-    infection_controller=None; _base_anomaly_on_disable()
-
-def stop(script=None):
-    on_disable()

@@ -60,13 +60,11 @@ except Exception as _infection_load_error:
 # Infection tuning approved after test
 # ---------------------------------------------------------------------------
 try:
-    # 20% per exposure roll: first detection in an active zone, then every 5s.
     INF_ZONE_CHANCE = 0.20
 
     _base_infection_progress = AnomalyInfectionController._progress_and_symptoms
 
     def _production_puke(self, player, minimum=None, maximum=None):
-        """Brewery visual looks best with 15-40 puke blocks."""
         try:
             amount = random.randint(15, 40)
             Bukkit.dispatchCommand(
@@ -82,7 +80,6 @@ try:
             )
 
     def _production_global_pulses(self, players):
-        """Stage II-III pulse at every real-world :00 and :30; stage I is silent."""
         try:
             local = time.localtime()
             minute = int(local.tm_min)
@@ -104,8 +101,6 @@ try:
             self._pulse(player, stage)
 
     def _hallucination_delay(stage):
-        # Stage I: rare; stage II: noticeably more often; stage III: never
-        # more frequent than roughly once every 3-5 minutes.
         if stage <= 1:
             return random.randint(12 * 60, 18 * 60)
         if stage == 2:
@@ -113,7 +108,6 @@ try:
         return random.randint(3 * 60, 5 * 60)
 
     def _play_hallucination(self, player, stage):
-        """Play a fake nearby mob/explosion sound to this player only."""
         try:
             base = player.getLocation()
             angle = random.random() * math.pi * 2.0
@@ -159,8 +153,6 @@ try:
             if sound is None:
                 return
 
-            # Player#playSound sends the positional sound only to this player.
-            # No entity, TNT or explosion is spawned in the world.
             player.playSound(sound_loc, sound, float(volume), float(pitch))
         except Exception as exc:
             self.manager.log_error_throttled(
@@ -263,10 +255,13 @@ try:
                     if len(converted) == 2:
                         prefix = converted[1].lower()
                         return build_java_list([
-                            item for item in ("list", "status", "infect", "stage", "clear")
-                            if item.startswith(prefix)
+                            item for item in (
+                                "list", "status", "stats", "history",
+                                "infect", "stage", "clear", "reset"
+                            ) if item.startswith(prefix)
                         ])
-                    if len(converted) == 3 and converted[1].lower() in ("status", "infect", "stage", "clear"):
+                    if len(converted) == 3 and converted[1].lower() in (
+                            "status", "history", "infect", "stage", "clear"):
                         prefix = converted[2].lower()
                         try:
                             return build_java_list([
@@ -276,6 +271,11 @@ try:
                             ])
                         except Exception:
                             return build_java_list([])
+                    if len(converted) == 3 and converted[1].lower() == "reset":
+                        return build_java_list([
+                            "confirm" for value in ("confirm",)
+                            if value.startswith(converted[2].lower())
+                        ])
                     if len(converted) == 4 and converted[1].lower() in ("infect", "stage"):
                         prefix = converted[3]
                         return build_java_list([v for v in ("1", "2", "3") if v.startswith(prefix)])

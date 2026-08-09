@@ -512,12 +512,14 @@ def ability_ultimate(player):
     player.setVelocity(Vector(0.0, 1.0, 0.0))
     world.playSound(player.getLocation(), Sound.ENTITY_WITHER_SPAWN, 0.7, 1.4)
 
+    # Замораживаем в воздухе (без гравитации) через 8 тиков — успевает подпрыгнуть.
     def freeze_air():
         if player.isOnline() and u in ultimate_lock:
             player.setGravity(False)
             player.setVelocity(Vector(0.0, 0.0, 0.0))
     scheduler.runTaskLater(freeze_air, 8)
 
+    # Одномоментный "выстрел" паутины во все стороны + урон.
     def unleash():
         if not player.isOnline():
             return
@@ -531,6 +533,7 @@ def ability_ultimate(player):
                 place_web_pillar(e.getLocation())
     scheduler.runTaskLater(unleash, 12)
 
+    # Периодические частицы вокруг игрока.
     def tick_particles(state=[0]):
         if not player.isOnline() or u not in ultimate_lock:
             return
@@ -541,6 +544,7 @@ def ability_ultimate(player):
             scheduler.runTaskLater(tick_particles, 5)
     scheduler.runTaskLater(tick_particles, 5)
 
+    # Финал — возврат гравитации + дебафф.
     def finish():
         ultimate_lock.discard(u)
         if player.isOnline():
@@ -556,6 +560,7 @@ def ability_ultimate(player):
 # =============================================================================
 
 def _deal_pure_damage(target, amount, attacker):
+    """Небольшой истинный урон без повторного прохождения через броню."""
     if not isinstance(target, LivingEntity) or target.isDead(): return
     hp = max(0.0, target.getHealth() - float(amount))
     if hp <= 0.0:
@@ -604,7 +609,7 @@ def ability_web_mace(player):
         for entity in _nearby_living(world, center, 3.2, player):
             eu = uid(entity)
             if now_tick() >= last_hits.get(eu, 0):
-                entity.damage(2.0, player)
+                entity.damage(2.0, player)  # 1 сердце; ниже предложенных 3 HP для PvP-баланса
                 last_hits[eu] = now_tick() + 10
         scheduler.runTaskLater(tick, 1)
     tick()
@@ -751,6 +756,7 @@ def start_web_horizon(owner, center):
     pull_tick()
 
 def start_web_trap(owner, center):
+    """Одноразовая невидимая ловушка; владелец видит слабый маркер."""
     end = now_tick() + 120 * 20
     record = {"owner": uid(owner), "center": center.clone(), "end": end}
     spider_traps.append(record)
@@ -777,6 +783,7 @@ def start_web_trap(owner, center):
 def start_spider_lunge(owner, target):
     start = owner.getLocation().clone(); start_y = start.getY()
     end = now_tick() + 22
+    # Урон на маршруте отменяется обработчиком on_damage_by.
     lunge_invulnerable.add(uid(owner))
     def tick():
         if not owner.isOnline() or not target.isValid() or target.isDead() or now_tick() >= end:
@@ -829,6 +836,7 @@ def fire_ejector(player, mode):
     quest_key = MODE_QUEST.get(mode)
     if quest_key is not None and not require_quest(player, quest_key):
         return
+    # Сначала проверяем личный КД режима, чтобы не сжечь патрон впустую.
     cd_preflight = {
         1:("line",u"«Паутинная нить»"), 2:("web_mace",u"«Паутинная булава»"),
         3:("trap",u"«Паутинное шенбяо»"), 4:("lunge",u"«Паучий выпад»"),
@@ -842,6 +850,7 @@ def fire_ejector(player, mode):
     if mode == 4 and _find_look_target(player, 40.0) is None:
         player.sendMessage(u"§cНет цели в прицеле на расстоянии до 40 блоков.")
         return
+    # Боевой режим тратит патрон только после успешных preflight-проверок.
     if mode != 0 and not _try_consume_ammo(player, u"эжектора"):
         return
 
@@ -887,6 +896,7 @@ def launch_web(player, mode_id, speed=1.8):
     pdc = proj.getPersistentDataContainer()
     pdc.set(KEY_PROJ,  PersistentDataType.INTEGER, mode_id)
     pdc.set(KEY_OWNER, PersistentDataType.STRING,  uid(player))
+    # Слегка "паучий" визуал на старте:
     player.getWorld().spawnParticle(
         Particle.ITEM_SNOWBALL,
         proj.getLocation(),
@@ -894,12 +904,15 @@ def launch_web(player, mode_id, speed=1.8):
     )
     player.getWorld().playSound(player.getLocation(), Sound.ENTITY_SPIDER_STEP, 0.6, 1.9)
 
+    # Тик-функция: рисует белую "паутинную нить" от игрока к текущей точке
+    # снаряда. Работает пока snowball жив.
     def _trail_tick(state=[0]):
         try:
             if not proj.isValid() or proj.isDead():
                 return
             world = proj.getWorld()
             proj_loc = proj.getLocation()
+            # Точка "запястья" игрока: чуть впереди и вниз от глаз.
             try:
                 if not player.isOnline():
                     return
@@ -910,6 +923,7 @@ def launch_web(player, mode_id, speed=1.8):
             except Exception:
                 start_loc = proj_loc.clone()
 
+            # Рисуем 8 частиц линии от start_loc до proj_loc.
             steps = 8
             dx = (proj_loc.getX() - start_loc.getX()) / float(steps)
             dy = (proj_loc.getY() - start_loc.getY()) / float(steps)
@@ -920,14 +934,17 @@ def launch_web(player, mode_id, speed=1.8):
                 pz = start_loc.getZ() + dz * i
                 point = start_loc.clone()
                 point.setX(px); point.setY(py); point.setZ(pz)
+                # Белая точечная частица (0-скорость, минимальный размер).
                 try:
+                    # Particle.DUST_PLUME или DUST — самые "белые/нейтральные".
+                    # Используем END_ROD — белая длинная искра.
                     world.spawnParticle(Particle.END_ROD, point, 1, 0.0, 0.0, 0.0, 0.0)
                 except Exception:
                     try:
                         world.spawnParticle(Particle.CRIT, point, 1, 0.0, 0.0, 0.0, 0.0)
                     except Exception: pass
             state[0] += 1
-            if state[0] < 60:
+            if state[0] < 60:   # максимум ~3 сек, снаряд быстрее упадёт
                 scheduler.runTaskLater(_trail_tick, 1)
         except Exception:
             pass
@@ -983,11 +1000,16 @@ def do_web_fire(player, projectile_mode=6):
     set_cd(player, "fireweb", CD_FIREWEB)
 
 
+# =============================================================================
+#  МЕХАНИКИ ПРИТЯЖЕНИЯ / БЛОКОВ / ЗАМОРОЗКИ
+# =============================================================================
+
 def _reset_fall(player):
     if player.isOnline():
         player.setFallDistance(0.0)
 
 def pull_shooter_to(player, target_loc):
+    """Тянет самого стрелка к точке (полёт на паутине)."""
     from_loc = player.getLocation()
     dv = target_loc.toVector().subtract(from_loc.toVector())
     dist = dv.length()
@@ -1005,6 +1027,7 @@ def pull_shooter_to(player, target_loc):
 
 
 def pull_target_to(target, dest_loc):
+    """Тянет цель к стрелку (паутинная нить)."""
     dv = dest_loc.toVector().subtract(target.getLocation().toVector())
     if dv.lengthSquared() < 0.01:
         return
@@ -1023,14 +1046,17 @@ def _is_replaceable(block):
     m = block.getType()
     return m.isAir() or m == Material.WATER or m == Material.SHORT_GRASS or m == Material.TALL_GRASS
 
+# Реестр всех временных паутин, заспавненных скриптом.
+# Ключ — строка "world,x,y,z", значение — tick времени спавна (не используется, но пригодится для отладки).
 web_blocks   = {}
-WEB_LIFETIME = 10 * 20
+WEB_LIFETIME = 10 * 20   # увеличено вдвое: было 5 секунд
 
 def _block_key(block):
     l = block.getLocation()
     return u"%s,%d,%d,%d" % (l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ())
 
 def _spawn_temp_web(block, lifetime=None):
+    """Ставит временную паутину и затем возвращает исходный BlockData."""
     if not _is_replaceable(block):
         return
     old_data = block.getBlockData().clone()
@@ -1039,6 +1065,7 @@ def _spawn_temp_web(block, lifetime=None):
     web_blocks[key] = {"spawn": now_tick(), "old": old_data}
 
     def remove():
+        # Удаляем только если это по-прежнему наша паутина.
         cur = block.getType()
         if cur == Material.COBWEB and key in web_blocks:
             try: block.setBlockData(web_blocks[key]["old"], False)
@@ -1059,6 +1086,7 @@ def place_web_pillar(loc):
 
 
 def apply_freeze(entity, duration_ticks):
+    """Держит entity в состоянии frozen нужное время, "подкачивая" freeze ticks."""
     if not isinstance(entity, LivingEntity):
         return
     max_freeze = entity.getMaxFreezeTicks()
@@ -1074,6 +1102,10 @@ def apply_freeze(entity, duration_ticks):
     tick()
 
 
+# =============================================================================
+#  ОБРАБОТКА ПОПАДАНИЯ СНАРЯДА
+# =============================================================================
+
 def _get_shooter(pdc):
     if not pdc.has(KEY_OWNER, PersistentDataType.STRING):
         return None
@@ -1084,6 +1116,9 @@ def _get_shooter(pdc):
 
 
 def _find_nearby_target(world, loc, shooter, radius=HIT_RADIUS):
+    """Толстый хитбокс: если снаряд попал в блок рядом с целью — ищем
+    ближайшего LivingEntity в кубе (radius x radius x radius) вокруг точки.
+    Не считаем самого стрелка."""
     try:
         candidates = world.getNearbyEntities(loc, radius, radius, radius)
     except Exception:
@@ -1118,6 +1153,7 @@ def on_proj_hit(event):
     loc         = proj.getLocation()
     world       = proj.getWorld()
 
+    # Полёт на паутине: сбрасываем "занят" в любом случае.
     if mode == 0:
         if shooter is not None:
             swing_active.discard(uid(shooter))
@@ -1128,15 +1164,19 @@ def on_proj_hit(event):
             world.playSound(target, Sound.BLOCK_LADDER_STEP, 0.8, 1.7)
         return
 
+    # Стрелок нужен для боевых режимов.
     if shooter is None:
         return
 
+    # ТОЛСТЫЙ ХИТБОКС: если снаряд попал в блок вплотную к цели, но прямого
+    # entity-хита не было — ищем ближайшего LivingEntity в кубе HIT_RADIUS.
     if hit_entity is None:
         found = _find_nearby_target(world, loc, shooter)
         if found is not None:
             hit_entity = found
 
     if mode == 1:
+        # Паутинная нить: тянем противника к стрелку.
         if isinstance(hit_entity, LivingEntity) and hit_entity != shooter:
             pull_target_to(hit_entity, shooter.getLocation())
             add_quest_progress(shooter, "bounce", 1)
@@ -1144,6 +1184,7 @@ def on_proj_hit(event):
             world.playSound(hit_entity.getLocation(), Sound.ENTITY_SPIDER_STEP, 0.9, 1.3)
 
     elif mode == 2:
+        # Паутинный шар: замедление 3 сек + блок паутины в точке.
         if isinstance(hit_entity, LivingEntity) and hit_entity != shooter:
             add_effect(hit_entity, E_SLOWNESS, 3 * 20, 1)
             place_web_single(hit_entity.getLocation())
@@ -1152,17 +1193,20 @@ def on_proj_hit(event):
         world.playSound(loc, Sound.BLOCK_WOOL_HIT, 1.0, 1.0)
 
     elif mode == 3:
+        # Паутинное шенбяо: точка столкновения становится ловушкой.
         center = hit_entity.getLocation() if hit_entity is not None else loc
         start_web_trap(shooter, center)
         world.playSound(center, Sound.BLOCK_TRIPWIRE_ATTACH, 1.0, 0.8)
 
     elif mode == 4:
+        # Снаряд нашёл цель — Паук начинает управляемый быстрый рывок.
         if isinstance(hit_entity, LivingEntity) and hit_entity != shooter:
             start_spider_lunge(shooter, hit_entity)
         else:
             shooter.sendMessage(u"§7Паучий выпад не зацепил цель.")
 
     elif mode == 12:
+        # Ударная паутина: базовый откид, которым открывается Ураган.
         if isinstance(hit_entity, LivingEntity) and hit_entity != shooter:
             hit_entity.damage(2.0, shooter)
             dv = hit_entity.getLocation().toVector().subtract(shooter.getLocation().toVector())
@@ -1176,6 +1220,7 @@ def on_proj_hit(event):
             world.playSound(hit_entity.getLocation(), Sound.ENTITY_PLAYER_ATTACK_STRONG, 1.0, 0.9)
 
     elif mode == 14:
+        # Паутинная граната: паутина под всеми живыми в радиусе 5 (кроме самого стрелка).
         center = hit_entity.getLocation() if hit_entity is not None else loc
         world.spawnParticle(Particle.CLOUD, center, 60, 3.0, 1.0, 3.0, 0.02)
         world.playSound(center, Sound.ENTITY_SNOWBALL_THROW, 1.2, 0.7)
@@ -1187,17 +1232,21 @@ def on_proj_hit(event):
                 continue
             place_web_under(e.getLocation())
             affected += 1
+        # Если никого не задело — ставим одиночную паутину в точке взрыва,
+        # чтобы способность имела визуальный эффект даже "в молоко".
         if affected == 0:
             place_web_single(center)
 
     elif mode == 10:
+        # Шок-Паутина: заморозка 6 сек.
         if isinstance(hit_entity, LivingEntity) and hit_entity != shooter:
             apply_freeze(hit_entity, 6 * 20)
-            add_effect(hit_entity, E_SLOWNESS, 6 * 20, 4)
+            add_effect(hit_entity, E_SLOWNESS, 6 * 20, 4)   # чтобы визуально стоял
             world.spawnParticle(Particle.SNOWFLAKE, hit_entity.getLocation(), 40, 0.6, 1.0, 0.6, 0.02)
             world.playSound(hit_entity.getLocation(), Sound.BLOCK_GLASS_BREAK, 1.0, 1.5)
 
     elif mode == 11:
+        # Огненная паутина: поджиг 8 сек + вспышка.
         if isinstance(hit_entity, LivingEntity) and hit_entity != shooter:
             hit_entity.setFireTicks(8 * 20)
             world.spawnParticle(Particle.FLAME, hit_entity.getLocation(), 30, 0.4, 0.6, 0.4, 0.03)
@@ -1215,6 +1264,10 @@ def on_proj_hit(event):
         start_web_horizon(shooter, center)
 
 
+# =============================================================================
+#  СЛУШАТЕЛИ
+# =============================================================================
+
 def _remember_tripwire_pulse(location, player=None):
     if location is None or location.getWorld() is None:
         return
@@ -1224,6 +1277,8 @@ def _remember_tripwire_pulse(location, player=None):
         pulse for pulse in recent_tripwire_pulses
         if int(pulse.get("tick", 0)) >= cutoff
     ]
+    # PlayerInteractEvent and BlockRedstoneEvent can describe the same press.
+    # Merge nearby records so one physical activation cannot count twice.
     for pulse in recent_tripwire_pulses:
         old = pulse.get("location")
         if old is None or old.getWorld() != location.getWorld():
@@ -1256,10 +1311,13 @@ def on_interact(event):
         return
     if action != Action.RIGHT_CLICK_AIR and action != Action.RIGHT_CLICK_BLOCK:
         return
+    # Отсекаем повторный вызов для off-hand.
     if event.getHand() != EquipmentSlot.HAND:
         return
     item = event.getItem()
 
+    # Квест Паутинного горизонта обрабатывается здесь же: PySpigot 0.9.1
+    # допускает только один listener одного Event-класса на скрипт.
     player = event.getPlayer()
     block = event.getClickedBlock()
     if (_is_spider_role(player) and block is not None and
@@ -1284,6 +1342,7 @@ def on_item_held(event):
         return
 
     diff = nxt - prev
+    # Компенсация обёртки 8→0 и 0→8.
     if   diff ==  8: direction = -1
     elif diff == -8: direction =  1
     elif diff  >  0: direction =  1
@@ -1291,7 +1350,7 @@ def on_item_held(event):
 
     new_mode = (get_mode(player) + direction) % (MODE_MAX + 1)
     set_mode(player, new_mode)
-    event.setCancelled(True)
+    event.setCancelled(True)   # откатывает слот автоматически
 
 
 def on_drop(event):
@@ -1302,6 +1361,7 @@ def on_drop(event):
 
 
 def on_block_break(event):
+    # Запрещаем ломать нашу временную паутину.
     block = event.getBlock()
     if block.getType() != Material.COBWEB:
         return
@@ -1345,6 +1405,7 @@ def _free_dodge_directions(player, attacker):
 
 def on_damage_by(event):
     victim = event.getEntity(); damager = event.getDamager()
+    # Паучий дрон никогда не атакует хозяина.
     if isinstance(damager, Vex) and uid(damager) in spider_drones and isinstance(victim, Player):
         if spider_drones[uid(damager)] == uid(victim):
             event.setCancelled(True); return
@@ -1368,6 +1429,7 @@ def _remove_wings(player, start_cooldown=True):
     rec = wings_active.pop(uid(player), None)
     if rec is None: return
     inv = player.getInventory()
+    # Удаляем временные элитры даже если игрок успел переложить их из нагрудника.
     for slot in range(inv.getSize()):
         item = inv.getItem(slot)
         if has_pdc_flag(item, KEY_WINGS): inv.setItem(slot, None)
@@ -1448,11 +1510,15 @@ def on_dispense(event):
         dx = abs(location.getBlockX() - block.getX())
         dy = abs(location.getBlockY() - block.getY())
         dz = abs(location.getBlockZ() - block.getZ())
+        # A full redstone-dust line carries a signal for 15 blocks, so the
+        # tripwire does not have to stand directly beside the dispenser.
         if dx <= 16 and dy <= 8 and dz <= 16 and age < matched_age:
             matched_index = index
             matched_age = age
     if matched_index is None:
         return
+    # Consume the pulse before awarding: redstone clocks cannot turn one press
+    # of the tripwire into several quest points.
     pulse = recent_tripwire_pulses.pop(matched_index)
     best = None
     pulse_player_uuid = pulse.get("player_uuid")
@@ -1478,11 +1544,16 @@ def on_quit(event):
 
 
 def on_proj_hit_safe(event):
+    # Простая защита от того, чтобы исключение в обработчике попадания не всплывало в консоль.
     try:
         on_proj_hit(event)
     except Exception as ex:
         Bukkit.getLogger().warning("[spider_agent] ProjectileHit error: " + str(ex))
 
+
+# =============================================================================
+#  КОМАНДЫ
+# =============================================================================
 
 def cmd_spider(sender, label, args):
     if not isinstance(sender, Player):
@@ -1529,8 +1600,15 @@ def cmd_spider(sender, label, args):
     return True
 
 
+# =============================================================================
+#  РЕГИСТРАЦИЯ
+# =============================================================================
+
 cmd_mgr.registerCommand(cmd_spider, "spider")
 
+# ---- Регистрация набора в JVM-глобальном реестре /test-диспетчера ----
+# Модуль pyspigot в PySpigot 0.9.1 не шарится между скриптами, поэтому
+# используем System.getProperties() — единый Hashtable на всю JVM.
 from java.util import HashMap as _JHashMap
 _REGISTRY_KEY = "pyspigot.character_kits"
 _props = System.getProperties()
@@ -1540,6 +1618,7 @@ if _reg is None:
     _props.put(_REGISTRY_KEY, _reg)
 _reg.put("spider", (kit_entry, u"Агент-Паук (маска + эжектор)"))
 
+# --- Публикация владельцев для admin-скрипта ---
 _OWNERS_KEY = "character_owners"
 _owners_reg = _props.get(_OWNERS_KEY)
 if _owners_reg is None:
@@ -1547,7 +1626,10 @@ if _owners_reg is None:
     _props.put(_OWNERS_KEY, _owners_reg)
 _owners_reg.put("spider", list(SPIDER_OWNERS))
 
-
+# --- Публикация особых предметов в каталог Зеркала Души Арчера ---
+# Фабрика возвращает ЧИСТЫЙ ItemStack I тира — без PDC, без наших флагов,
+# без владельца. Всю Арчер-обёртку (санитайзинг, TTL, kind=mirror) делает сам
+# скрипт Арчера в _sanitize_mirror(); нам достаточно вернуть материал + внешний вид.
 def _spider_mirror_mask(owner_uuid):
     it = ItemStack(Material.LEATHER_HELMET, 1)
     meta = it.getItemMeta()
@@ -1610,6 +1692,7 @@ def _cleanup_stale_spider_entities():
 _cleanup_stale_spider_entities()
 
 def stop(script=None):
+    # Не оставляем временные крылья/дронов после /pyspigot reload.
     for player_uuid in list(wings_active.keys()):
         try:
             player = Bukkit.getPlayer(JUUID.fromString(player_uuid))
@@ -1628,233 +1711,3 @@ def stop(script=None):
     temporary_anchors[:] = []
 
 Bukkit.getLogger().info("[spider_agent] Agent Spider loaded. Commands: /test spider, /spider <ability>")
-
-# =============================================================================
-#  PRODUCTION: tested integration from zz_spider_hotfix.py
-# =============================================================================
-
-HEAD_OWNER = u"BigBoyeDuniel"
-_HEAD_PROFILE = [None]
-
-
-def _spider_sr_api():
-    try:
-        from net.skinsrestorer.api import SkinsRestorerProvider
-        return SkinsRestorerProvider.get()
-    except Exception:
-        try:
-            plugin = Bukkit.getPluginManager().getPlugin("SkinsRestorer")
-            if plugin is None:
-                Bukkit.getLogger().warning("[spider_agent] SkinsRestorer plugin not found")
-                return None
-            loader = plugin.getClass().getClassLoader()
-            provider_cls = loader.loadClass("net.skinsrestorer.api.SkinsRestorerProvider")
-            for method in provider_cls.getDeclaredMethods():
-                if method.getName() == "get" and method.getParameterTypes().length == 0:
-                    return method.invoke(None)
-        except Exception as ex:
-            Bukkit.getLogger().warning("[spider_agent] SkinsRestorer API unavailable: " + str(ex))
-    return None
-
-
-def _spider_head_profile():
-    if _HEAD_PROFILE[0] is not None:
-        return _HEAD_PROFILE[0]
-    try:
-        from com.destroystokyo.paper.profile import ProfileProperty
-        api = _spider_sr_api()
-        if api is not None:
-            offline = Bukkit.getOfflinePlayer(HEAD_OWNER)
-            owner_uuid = offline.getUniqueId()
-            storage = api.getPlayerStorage()
-            optional = storage.getSkinForPlayer(owner_uuid, HEAD_OWNER, False)
-            if optional is None or not optional.isPresent():
-                try:
-                    optional = storage.getSkinOfPlayer(owner_uuid)
-                except Exception:
-                    pass
-            if optional is not None and optional.isPresent():
-                prop = optional.get()
-                value = prop.getValue()
-                signature = prop.getSignature()
-                if value is not None and len(str(value)) > 0:
-                    profile = Bukkit.createProfileExact(owner_uuid, HEAD_OWNER)
-                    profile.clearProperties()
-                    if signature is None or len(str(signature)) == 0:
-                        profile.setProperty(ProfileProperty("textures", value))
-                    else:
-                        profile.setProperty(ProfileProperty("textures", value, signature))
-                    _HEAD_PROFILE[0] = profile
-                    Bukkit.getLogger().info("[spider_agent] loaded BigBoyeDuniel texture from SkinsRestorer")
-                    return profile
-    except Exception as ex:
-        Bukkit.getLogger().warning("[spider_agent] SkinsRestorer head profile failed: " + str(ex))
-
-    try:
-        profile = Bukkit.createProfile(HEAD_OWNER)
-        try:
-            profile.complete(True)
-        except Exception:
-            pass
-        _HEAD_PROFILE[0] = profile
-        return profile
-    except Exception:
-        return None
-
-
-def _apply_spider_head(meta):
-    profile = _spider_head_profile()
-    if profile is not None:
-        try:
-            meta.setPlayerProfile(profile)
-            return
-        except Exception:
-            pass
-    try:
-        meta.setOwningPlayer(Bukkit.getOfflinePlayer(HEAD_OWNER))
-    except Exception:
-        pass
-
-
-def create_mask():
-    it = ItemStack(Material.PLAYER_HEAD, 1)
-    meta = it.getItemMeta()
-    meta.setDisplayName(u"§c§lМаска Агент-Паука")
-    meta.setLore(java_list([
-        u"§7Маска Агент-Паука.",
-        u"§7Внешность: §f" + HEAD_OWNER,
-        u"",
-        u"§8Не даёт очков брони.",
-        u"§8Обязательна для использования способностей.",
-    ]))
-    _apply_spider_head(meta)
-    set_pdc_flag(meta, KEY_MASK)
-    it.setItemMeta(meta)
-    return it
-
-
-def create_ejector():
-    it = ItemStack(Material.PRISMARINE_SHARD, 1)
-    meta = it.getItemMeta()
-    meta.setDisplayName(u"§f§lЭжектор паутины")
-    meta.setLore(java_list([
-        u"§7Компактный механизм выброса паутины",
-        u"§7с 15 боевыми режимами.",
-        u"",
-        u"§8Режим: §bПолёт на паутине §7[0]",
-        u"§8Shift + Колесо мыши — смена режима",
-        u"§8ПКМ — выстрел",
-    ]))
-    meta.setUnbreakable(True)
-    set_pdc_flag(meta, KEY_EJECTOR)
-    it.setItemMeta(meta)
-    return it
-
-
-MODE_INFO[13] = (u"Паутинный шар", u"§f")
-MODE_INFO[14] = (u"Паутинная граната", u"§a")
-MODE_MAX = 14
-
-
-def update_ejector_lore(player):
-    inv = player.getInventory()
-    for i in range(9):
-        item = inv.getItem(i)
-        if not is_ejector(item):
-            continue
-        mode = get_mode(player)
-        name, color = MODE_INFO[mode]
-        meta = item.getItemMeta()
-        meta.setLore(java_list([
-            u"§7Компактный механизм выброса паутины",
-            u"§7с 15 боевыми режимами.",
-            u"",
-            u"§8Режим: " + color + name + u" §7[" + str(mode) + u"]",
-            u"§8Shift + Колесо мыши — смена режима",
-            u"§8ПКМ — выстрел",
-        ]))
-        item.setItemMeta(meta)
-
-
-def set_mode(player, mode):
-    mode = mode % (MODE_MAX + 1)
-    player_mode[uid(player)] = mode
-    name, color = MODE_INFO[mode]
-    text = u"§8⌬ §fРежим эжектора: " + color + name + u" §7[" + str(mode) + u"]"
-    try:
-        player.sendActionBar(text)
-    except Exception as ex:
-        Bukkit.getLogger().warning("[spider_agent] actionbar failed: " + str(ex))
-
-    def show_again():
-        try:
-            if player.isOnline() and get_mode(player) == mode:
-                player.sendActionBar(text)
-        except Exception:
-            pass
-
-    scheduler.runTaskLater(show_again, 2)
-    try:
-        player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.6, 1.7)
-    except Exception:
-        pass
-    update_ejector_lore(player)
-
-
-_original_fire_ejector = fire_ejector
-
-
-def fire_ejector(player, mode):
-    if mode <= 12:
-        return _original_fire_ejector(player, mode)
-
-    if not wearing_mask(player):
-        player.sendMessage(u"§cДля активации эжектора нужна маска.")
-        return
-    if is_silenced_by_demiurg(player):
-        player.sendMessage(u"§8Твои способности заглушены §dЗаконом Тишины§8.")
-        return
-    if uid(player) in ultimate_lock:
-        return
-
-    if mode == 13:
-        if not check_cd(player, "ball", u"«Паутинный шар»"):
-            return
-        if not _try_consume_ammo(player, u"эжектора"):
-            return
-        do_web_ball(player)
-        return
-
-    if mode == 14:
-        if not check_cd(player, "grenade", u"«Паутинная граната»"):
-            return
-        if not _try_consume_ammo(player, u"эжектора"):
-            return
-        launch_web(player, 14, 1.6)
-        set_cd(player, "grenade", CD_GRENADE)
-        return
-
-
-def do_web_grenade(player):
-    if not check_cd(player, "grenade", u"«Паутинная граната»"):
-        return
-    launch_web(player, 14, 1.6)
-    set_cd(player, "grenade", CD_GRENADE)
-
-
-def _spider_mirror_mask(owner_uuid):
-    it = ItemStack(Material.PLAYER_HEAD, 1)
-    meta = it.getItemMeta()
-    meta.setDisplayName(u"§cМаска Агент-Паука")
-    _apply_spider_head(meta)
-    it.setItemMeta(meta)
-    return it
-
-try:
-    _mirror_entry = _mirror_cat.get("spider:mask")
-    if _mirror_entry is not None:
-        _mirror_entry.put("factory", _spider_mirror_mask)
-except Exception:
-    pass
-
-Bukkit.getLogger().info("[spider_agent] Production integration active: SR head + 15 modes + ActionBar selector")

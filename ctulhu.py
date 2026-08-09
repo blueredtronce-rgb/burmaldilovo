@@ -26,7 +26,7 @@ listener_mgr = ps.listener_manager()
 scheduler = ps.scheduler
 
 CTHULHU_OWNERS = set([u"lox"])
-FREE_CD_PLAYERS = set([u"blueredtronce"])
+FREE_CD_PLAYERS = set([u"lox"])
 KEY_TRIDENT = NamespacedKey.fromString("cthulhu:crimson_trident")
 KEY_TIER = NamespacedKey.fromString("cthulhu:tier")
 CD_WHISPER = 35 * 20
@@ -110,11 +110,15 @@ def give_kit(player, level=1):
 
 def target_in_sight(player, distance):
     try:
-        ray = player.rayTraceEntities(float(distance))
+        # Paper 1.21.x exposes rayTraceEntities(int). Passing a Python float from
+        # Jython fails Java overload resolution; the old broad except then hid the
+        # error and every targeted ability behaved as if no entity was visible.
+        ray = player.rayTraceEntities(int(distance))
         if ray is None: return None
         target = ray.getHitEntity()
         if isinstance(target, LivingEntity) and target != player and player.hasLineOfSight(target): return target
-    except Exception: pass
+    except Exception as ex:
+        Bukkit.getLogger().warning("[cthulhu] target ray trace failed: " + str(ex))
     return None
 def nearby_enemies(player, radius):
     result = []

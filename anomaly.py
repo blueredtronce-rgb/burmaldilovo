@@ -62,8 +62,6 @@ except Exception as _infection_load_error:
 try:
     INF_ZONE_CHANCE = 0.20
 
-    _base_infection_progress = AnomalyInfectionController._progress_and_symptoms
-
     def _production_puke(self, player, minimum=None, maximum=None):
         try:
             amount = random.randint(15, 40)
@@ -162,12 +160,40 @@ try:
                 120
             )
 
+    def _online_stage1_symptom(self, player, record, now):
+        strange = (
+            "AMBIENT_CAVE",
+            "BLOCK_SCULK_SENSOR_CLICKING",
+            "ENTITY_ENDERMAN_STARE",
+            "BLOCK_RESPAWN_ANCHOR_DEPLETE"
+        )
+        online_seconds = safe_int(record.get("stage_online_seconds"), 0)
+        if online_seconds < INF_STAGE1_LATENT_SECONDS:
+            self._play_private(player, strange, 0.30)
+            return
+        roll = random.random()
+        if roll < 0.48:
+            self._play_private(player, strange, 0.35)
+        elif roll < 0.73:
+            self._particles(player, False, random.randint(2, 5))
+            self._play_private(player, strange, 0.25)
+        else:
+            self._effect(player, _INF_NAUSEA, 5)
+            self._play_private(player, strange, 0.35)
+            if random.random() < 0.35:
+                self._puke(player, 1, 2)
+
     def _production_progress_and_symptoms(self, players, now):
-        _base_infection_progress(self, players, now)
         if not hasattr(self, "hallucination_next"):
             self.hallucination_next = {}
+        if not hasattr(self, "online_progress_last_tick"):
+            self.online_progress_last_tick = {}
+        if not hasattr(self, "online_progress_last_save"):
+            self.online_progress_last_save = now
 
         online = set()
+        dirty = False
+
         for player in players:
             try:
                 uid_key = self.uid(player)
@@ -175,27 +201,88 @@ try:
                 record = self.record(player)
                 if record is None:
                     self.hallucination_next.pop(uid_key, None)
+                    self.online_progress_last_tick.pop(uid_key, None)
                     continue
+
+                # Count only time while this player is actually online. The
+                # first tick after join/reload establishes a baseline and adds
+                # nothing, so offline time can never leak into progression.
+                previous_tick = self.online_progress_last_tick.get(uid_key)
+                self.online_progress_last_tick[uid_key] = now
+                if "stage_online_seconds" not in record:
+                    record["stage_online_seconds"] = 0
+                    dirty = True
+                if previous_tick is not None:
+                    elapsed = max(0, safe_int(now - previous_tick, 0))
+                    if elapsed > 0:
+                        record["stage_online_seconds"] = (
+                            safe_int(record.get("stage_online_seconds"), 0) + elapsed
+                        )
+                        dirty = True
+
                 stage = safe_int(record.get("stage"), 1, 1, 3)
-                due = safe_int(self.hallucination_next.get(uid_key), 0)
+                online_seconds = safe_int(record.get("stage_online_seconds"), 0)
+                required = INF_STAGE1_SECONDS if stage == 1 else INF_STAGE2_SECONDS
+
+                if stage < 3 and online_seconds >= required:
+                    overflow = max(0, online_seconds - required)
+                    stage += 1
+                    record["stage"] = stage
+                    record["stage_started_at"] = now
+                    record["stage_online_seconds"] = overflow if stage < 3 else 0
+                    record["insomnia_night_key"] = None
+                    record["insomnia_blocked"] = False
+                    self.symptom_next[uid_key] = now + random.randint(20, 60)
+                    dirty = True
+                    self._save()
+                    self.online_progress_last_save = now
+                    dirty = False
+                    log_action(u"Infection progressed by ONLINE time: {0} -> stage {1}.".format(
+                        player.getName(), stage
+                    ))
+
+                due = safe_int(self.symptom_next.get(uid_key), 0)
                 if due <= 0:
+                    self.symptom_next[uid_key] = now + self._symptom_delay(stage)
+                elif now >= due:
+                    if stage == 1:
+                        _online_stage1_symptom(self, player, record, now)
+                    else:
+                        self._stage2_or_3_symptom(player, stage)
+                    self.symptom_next[uid_key] = now + self._symptom_delay(stage)
+
+                if stage >= 3:
+                    self._random_compass(player, now)
+
+                hall_due = safe_int(self.hallucination_next.get(uid_key), 0)
+                if hall_due <= 0:
                     self.hallucination_next[uid_key] = now + _hallucination_delay(stage)
-                    continue
-                if now < due:
-                    continue
-                _play_hallucination(self, player, stage)
-                self.hallucination_next[uid_key] = now + _hallucination_delay(stage)
+                elif now >= hall_due:
+                    _play_hallucination(self, player, stage)
+                    self.hallucination_next[uid_key] = now + _hallucination_delay(stage)
             except Exception as exc:
                 self.manager.log_error_throttled(
-                    "infection-hallucination-cycle",
-                    u"Infection hallucination cycle failed",
+                    "infection-online-progression-cycle",
+                    u"Infection online progression cycle failed",
                     exc,
                     120
                 )
 
+        # Forget baselines for players who left. If they return hours later,
+        # their first tick starts from zero elapsed offline time.
+        for uid_key in list(self.online_progress_last_tick.keys()):
+            if uid_key not in online:
+                self.online_progress_last_tick.pop(uid_key, None)
         for uid_key in list(self.hallucination_next.keys()):
             if uid_key not in online:
                 self.hallucination_next.pop(uid_key, None)
+
+        # Persist accumulated online time once a minute. A crash can therefore
+        # lose at most roughly one minute of progression, while normal restart
+        # calls stop() and saves immediately.
+        if dirty and now - safe_int(self.online_progress_last_save, now) >= 60:
+            if self._save():
+                self.online_progress_last_save = now
 
     def _unique_zone_seed_count(self):
         """Count unique natural carriers, not repeated ZONE events."""
@@ -209,7 +296,6 @@ try:
             if uid_key:
                 seed_keys.add(u"uuid:" + uid_key)
             else:
-                # Legacy fallback for an old event without UUID.
                 seed_keys.add(u"name:" + to_unicode(event.get("target_name") or u"?").lower())
         return len(seed_keys)
 
@@ -220,8 +306,10 @@ try:
 
     if infection_controller is not None:
         infection_controller.hallucination_next = {}
+        infection_controller.online_progress_last_tick = {}
+        infection_controller.online_progress_last_save = now_ts()
 
-    log_action(u"Infection tuning installed: zone=20%, unique zone seeds=3, pulse=30m S2-S3, puke=15-40, hallucinations enabled.")
+    log_action(u"Infection tuning installed: zone=20%, unique zone seeds=3, ONLINE stage timers 2h+4h, pulse=30m S2-S3, puke=15-40, hallucinations enabled.")
 except Exception as _infection_tuning_error:
     try:
         log_error(u"Cannot install infection tuning", _infection_tuning_error)

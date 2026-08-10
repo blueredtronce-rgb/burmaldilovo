@@ -6,6 +6,7 @@ Windows/PySpigot-safe layout:
 - anomaly.py is the only executable PySpigot script.
 - anomaly_core.inc contains the exact production anomaly implementation from for-cg.
 - anomaly_infection.inc contains the additive infection extension.
+- anomaly_research.inc contains the experimental laboratory / gas-mask extension.
 
 PySpigot scans .py files in its scripts directory as standalone scripts, so the
 internal implementation files deliberately use the .inc extension and are
@@ -42,6 +43,7 @@ def _exec_required(path, label):
 _ANOMALY_SCRIPT_DIR = _anomaly_script_dir()
 _ANOMALY_CORE = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_core.inc")
 _ANOMALY_INFECTION = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_infection.inc")
+_ANOMALY_RESEARCH = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_research.inc")
 
 _exec_required(_ANOMALY_CORE, "anomaly core")
 
@@ -317,6 +319,20 @@ except Exception as _infection_tuning_error:
         pass
 
 # ---------------------------------------------------------------------------
+# Research extension (experimental gas mask + laboratory trials)
+# ---------------------------------------------------------------------------
+try:
+    _exec_required(_ANOMALY_RESEARCH, "research extension")
+except Exception as _research_load_error:
+    try:
+        log_error(u"Fatal research extension load error", _research_load_error)
+    except Exception:
+        try:
+            print("[SmartY-Anomalies] research extension load error: " + str(_research_load_error))
+        except Exception:
+            pass
+
+# ---------------------------------------------------------------------------
 # Robust command bridge for Jython/PySpigot
 # ---------------------------------------------------------------------------
 try:
@@ -362,7 +378,8 @@ try:
                         return build_java_list([
                             item for item in (
                                 "list", "status", "stats", "history",
-                                "infect", "stage", "clear", "reset"
+                                "infect", "stage", "clear", "reset",
+                                "gasmask", "lab", "labtest"
                             ) if item.startswith(prefix)
                         ])
                     if len(converted) == 3 and converted[1].lower() in (
@@ -381,6 +398,39 @@ try:
                             "confirm" for value in ("confirm",)
                             if value.startswith(converted[2].lower())
                         ])
+                    if len(converted) == 3 and converted[1].lower() == "gasmask":
+                        prefix = converted[2].lower()
+                        return build_java_list([
+                            value for value in ("give", "status") if value.startswith(prefix)
+                        ])
+                    if len(converted) == 3 and converted[1].lower() == "lab":
+                        prefix = converted[2].lower()
+                        return build_java_list([
+                            value for value in ("set", "status") if value.startswith(prefix)
+                        ])
+                    if len(converted) == 4 and converted[1].lower() == "gasmask" and converted[2].lower() in ("give", "status"):
+                        prefix = converted[3].lower()
+                        try:
+                            return build_java_list([
+                                to_unicode(player.getName())
+                                for player in Bukkit.getOnlinePlayers()
+                                if to_unicode(player.getName()).lower().startswith(prefix)
+                            ])
+                        except Exception:
+                            return build_java_list([])
+                    if len(converted) == 4 and converted[1].lower() == "lab" and converted[2].lower() == "set":
+                        prefix = converted[3]
+                        return build_java_list([value for value in ("1", "2") if value.startswith(prefix)])
+                    if len(converted) == 3 and converted[1].lower() == "labtest":
+                        prefix = converted[2].lower()
+                        try:
+                            return build_java_list([
+                                to_unicode(player.getName())
+                                for player in Bukkit.getOnlinePlayers()
+                                if to_unicode(player.getName()).lower().startswith(prefix)
+                            ])
+                        except Exception:
+                            return build_java_list([])
                     if len(converted) == 4 and converted[1].lower() in ("infect", "stage"):
                         prefix = converted[3]
                         return build_java_list([v for v in ("1", "2", "3") if v.startswith(prefix)])

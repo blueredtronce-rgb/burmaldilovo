@@ -8,9 +8,11 @@ Current research arc:
 - Isolation Suit Mk.II: 100% CONTACT protection while the complete seal survives.
   Mk.II keeps ordinary leather-armor durability and additionally wears down
   while standing close to infectious S2/S3 carriers.
-- Two laboratory pods plus a physical lever terminal. Researchers can start a
-  safe animated comparative test by pulling the configured lever; no admin
-  command is needed for normal RP use.
+- Two laboratory pods plus a physical lever terminal. Registered pods are true
+  isolation chambers: CONTACT transmission is blocked between occupants of two
+  different pods, matching the hardened-glass RP setup.
+- Researchers can start a safe animated comparative test by pulling the
+  configured lever; no admin command is needed for normal RP use.
 - Resonator Mk.I mechanics are prebuilt but locked by default. Admin can unlock
   them only when the story reaches the diagnostic/resonance phase.
 - Hidden admin helpers live under /anomaly infection suit|lab|labtest|research|resonator.
@@ -578,8 +580,8 @@ def _research_print_recipe(controller, sender, version):
         send_message(sender, u"&7Нагрудник: &fCAC / WNW / SHS")
         send_message(sender, u"&7Поножи: &fCAC / WLW / SHS")
         send_message(sender, u"&7Ботинки: &fCAC / WBW / SHS")
-        send_message(sender, u"&8C=медь, G=стекло, W=шерсть, S=слизь, A=аметист, H=соты.")
-        send_message(sender, u"&8H/N/L/B в центре = кожаная база соответствующей части.")
+        send_message(sender, u"&8Шлем: C=медь, G=стекло, W=шерсть, H=кожаный шлем, S=слизь, A=аметист.")
+        send_message(sender, u"&8Остальное: C=медь, A=аметист, W=шерсть, S=слизь, H=соты; N/L/B=кожаная база.")
         return True
 
     send_message(sender, AnomalyConfig.PREFIX + u"&eРецепт Изоляционного костюма Mk.I")
@@ -725,6 +727,37 @@ def _research_lab_status(controller, sender):
     else:
         send_message(sender, AnomalyConfig.PREFIX + u"&7Терминал: &cне задан")
     return True
+
+
+def _research_player_pod(controller, player):
+    root = _research_root(controller)
+    pods = root.get("lab_pods", {})
+    try:
+        loc = player.getLocation()
+        world_name = to_unicode(loc.getWorld().getName())
+    except Exception:
+        return None
+
+    radius_sq = RESEARCH_LAB_RADIUS * RESEARCH_LAB_RADIUS
+    best = None
+    best_sq = radius_sq
+    for pod_id in ("1", "2"):
+        pod = pods.get(pod_id)
+        if not isinstance(pod, dict):
+            continue
+        if to_unicode(pod.get("world") or u"") != world_name:
+            continue
+        try:
+            dx = float(loc.getX()) - float(pod.get("x"))
+            dy = float(loc.getY()) - float(pod.get("y"))
+            dz = float(loc.getZ()) - float(pod.get("z"))
+            dist_sq = dx * dx + dy * dy + dz * dz
+            if dist_sq <= best_sq:
+                best = pod_id
+                best_sq = dist_sq
+        except Exception:
+            continue
+    return best
 
 
 def _research_pod_occupant(controller, pod_id):
@@ -1142,6 +1175,14 @@ try:
             if nearest is None:
                 continue
 
+            # Hardened-glass laboratory pods are real isolation chambers. A
+            # carrier in pod 1 cannot infect a healthy subject in pod 2 merely
+            # because the Bukkit distance check crosses the glass wall.
+            source_pod = _research_player_pod(self, nearest)
+            target_pod = _research_player_pod(self, target)
+            if source_pod is not None and target_pod is not None and source_pod != target_pod:
+                continue
+
             state = _research_suit_state(self, target)
 
             # Mk.II is a perfect CONTACT barrier while all four pieces survive.
@@ -1347,7 +1388,7 @@ try:
 
     log_action(
         u"Research extension installed: Suit Mk.I, degradable 100% CONTACT Suit Mk.II, "
-        u"physical lab lever terminal, locked Resonator Mk.I."
+        u"isolated lab pods, physical lever terminal, locked Resonator Mk.I."
     )
 except Exception as _research_install_error:
     try:

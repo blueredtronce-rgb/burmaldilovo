@@ -7,6 +7,7 @@ Windows/PySpigot-safe layout:
 - anomaly_core.inc contains the exact production anomaly implementation from for-cg.
 - anomaly_infection.inc contains the additive infection extension.
 - anomaly_research.inc contains the experimental laboratory / gas-mask extension.
+- anomaly_contact_barriers.inc contains final CONTACT block/barrier rules.
 
 PySpigot scans .py files in its scripts directory as standalone scripts, so the
 internal implementation files deliberately use the .inc extension and are
@@ -44,6 +45,7 @@ _ANOMALY_SCRIPT_DIR = _anomaly_script_dir()
 _ANOMALY_CORE = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_core.inc")
 _ANOMALY_INFECTION = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_infection.inc")
 _ANOMALY_RESEARCH = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_research.inc")
+_ANOMALY_CONTACT_BARRIERS = os.path.join(_ANOMALY_SCRIPT_DIR, "anomaly_contact_barriers.inc")
 
 _exec_required(_ANOMALY_CORE, "anomaly core")
 
@@ -206,9 +208,6 @@ try:
                     self.online_progress_last_tick.pop(uid_key, None)
                     continue
 
-                # Count only time while this player is actually online. The
-                # first tick after join/reload establishes a baseline and adds
-                # nothing, so offline time can never leak into progression.
                 previous_tick = self.online_progress_last_tick.get(uid_key)
                 self.online_progress_last_tick[uid_key] = now
                 if "stage_online_seconds" not in record:
@@ -270,8 +269,6 @@ try:
                     120
                 )
 
-        # Forget baselines for players who left. If they return hours later,
-        # their first tick starts from zero elapsed offline time.
         for uid_key in list(self.online_progress_last_tick.keys()):
             if uid_key not in online:
                 self.online_progress_last_tick.pop(uid_key, None)
@@ -279,15 +276,11 @@ try:
             if uid_key not in online:
                 self.hallucination_next.pop(uid_key, None)
 
-        # Persist accumulated online time once a minute. A crash can therefore
-        # lose at most roughly one minute of progression, while normal restart
-        # calls stop() and saves immediately.
         if dirty and now - safe_int(self.online_progress_last_save, now) >= 60:
             if self._save():
                 self.online_progress_last_save = now
 
     def _unique_zone_seed_count(self):
-        """Count unique natural carriers, not repeated ZONE events."""
         seed_keys = set()
         for event in self.data.get("events", []):
             if not isinstance(event, dict):
@@ -319,7 +312,7 @@ except Exception as _infection_tuning_error:
         pass
 
 # ---------------------------------------------------------------------------
-# Research extension (experimental gas mask + laboratory trials)
+# Research extension
 # ---------------------------------------------------------------------------
 try:
     _exec_required(_ANOMALY_RESEARCH, "research extension")
@@ -329,6 +322,20 @@ except Exception as _research_load_error:
     except Exception:
         try:
             print("[SmartY-Anomalies] research extension load error: " + str(_research_load_error))
+        except Exception:
+            pass
+
+# ---------------------------------------------------------------------------
+# CONTACT barrier extension -- load after research
+# ---------------------------------------------------------------------------
+try:
+    _exec_required(_ANOMALY_CONTACT_BARRIERS, "contact barrier extension")
+except Exception as _barrier_load_error:
+    try:
+        log_error(u"Fatal contact barrier extension load error", _barrier_load_error)
+    except Exception:
+        try:
+            print("[SmartY-Anomalies] contact barrier extension load error: " + str(_barrier_load_error))
         except Exception:
             pass
 
